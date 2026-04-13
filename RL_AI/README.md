@@ -1,338 +1,78 @@
-# RL_AI 
+# 👑 Call of the King: RL_AI (SeaEngine Edition)
 
-`RL_AI`는 `Call of the King`의 실험/학습 레이어입니다.  
-지금 기준의 실제 게임 로직 source of truth는 Python 프로토타입이 아니라 **C# SeaEngine**이고, Python은 그 위에서:
+`RL_AI`는 C# 기반 보드게임 엔진 **SeaEngine** 위에서 동작하는 최첨단 강화학습 실험 레이어입니다.  
+현재 프로젝트는 단순한 로직 구현을 넘어, **병렬 데이터 수집**과 **비동기 통신**을 통한 학습 가속화 단계에 도달해 있습니다.
 
-- C# 엔진 실행
-- 상태 관측 변환
-- 에이전트 선택
-- PPO 학습
-- 평가 / 리포트 저장
+---
 
-을 담당합니다.
+## 🏗️ 시스템 아키텍처
 
-## 현재 구조
-
-핵심 디렉터리:
-
-- [SeaEngine](C:/code/capstone-temp/RL_AI/SeaEngine)
-  - C# SeaEngine 브리지, observation, RL trainer/evaluator
-- [SeaEngine/csharp/SeaEngine](C:/code/capstone-temp/RL_AI/SeaEngine/csharp/SeaEngine)
-  - 복사된 C# 게임 엔진
-- [SeaEngine/csharp/SeaEngineCli](C:/code/capstone-temp/RL_AI/SeaEngine/csharp/SeaEngineCli)
-  - Python이 C# 엔진과 통신하기 위한 CLI 브리지
-- [simulation/match_runner.py](C:/code/capstone-temp/RL_AI/simulation/match_runner.py)
-  - Python legacy 엔진 매치 러너 + SeaEngine 매치 러너 통합 진입점
-- [start.ipynb](C:/code/capstone-temp/RL_AI/start.ipynb)
-  - DLPC에서 실행하는 기본 notebook
-- [cards/Cards.csv](C:/code/capstone-temp/RL_AI/cards/Cards.csv)
-  - 카드 데이터
-- [log](C:/code/capstone-temp/RL_AI/log)
-  - 평가 / 학습 리포트 저장 위치
-
-legacy Python 엔진 파일은 별도 보관되어 있고, 현재 SeaEngine 실험과는 분리되어 있습니다.
-
-## 실제 호출 흐름
-
-현재 SeaEngine 기준 흐름은 이렇습니다.
+현재 시스템은 **Python(지능)**과 **C#(육체)**이 분리된 하이브리드 구조입니다.
 
 ```text
-start.ipynb
-  -> RL_AI.SeaEngine.experiment.run_train_eval_experiment()
-    -> SeaEnginePPOTrainer / evaluator
-      -> SeaEngineSession
-        -> SeaEngineCli
-          -> C# SeaEngine Game
+[ start.ipynb ] (User Interface)
+      ↓ (await)
+[ experiment.py ] (Global Loop & Checkpointing)
+      ↓ (async)
+[ trainer.py ] (PPO Algorithm & Rollout Management)
+      ↓ (await)
+[ VectorSeaEngineEnv ] (Parallel Environment Manager)
+      ↓ (Multi-Process IPC)
+[ SeaEngineCli (C#) ] × 8 Engines (Concurrent Simulation)
 ```
 
-조금 더 풀면:
+### ⚡ 핵심 기술적 특징
+- **Vectorized Environment**: 8개 이상의 C# 엔진을 동시에 구동하여 데이터를 병렬로 수집합니다.
+- **Batched Inference**: 병렬 환경의 상태를 하나로 묶어 GPU에서 한 번에 추론하여 효율을 극대화했습니다.
+- **Pure Async Architecture**: 주피터 노트북의 루프 충돌 문제를 해결하기 위해 전체 파이프라인을 `async/await` 기반의 순수 비동기로 재설계했습니다.
+- **Automated Log Management**: 실험 종료 시 생성된 로그를 자동 압축(.zip)하고 정리하여 저장 공간을 효율적으로 관리합니다.
 
-1. Python이 [seaengine_session.py](C:/code/capstone-temp/RL_AI/SeaEngine/bridge/seaengine_session.py) 로 `SeaEngineCli` 프로세스를 띄움
-2. `SeaEngineCli`가 C# `Game` 객체를 메모리에 유지
-3. Python은 `init / snapshot / apply / close` 요청만 JSON으로 주고받음
-4. snapshot은 [observation.py](C:/code/capstone-temp/RL_AI/SeaEngine/observation.py) 에서 RL 입력으로 변환됨
-5. [agents.py](C:/code/capstone-temp/RL_AI/SeaEngine/agents.py) 의 `Random / Greedy / RL` 에이전트가 action을 선택
-6. [trainer.py](C:/code/capstone-temp/RL_AI/SeaEngine/trainer.py) 가 rollout 수집 + PPO update
-7. [evaluator.py](C:/code/capstone-temp/RL_AI/SeaEngine/evaluator.py) 가 다회전 평가 후 리포트 저장
+---
 
-## 매치 러너
+## 📁 디렉토리 구조 (Standardized)
 
-통합된 진입점:
-- [match_runner.py](C:/code/capstone-temp/RL_AI/simulation/match_runner.py)
+- **[SeaEngine/](RL_AI/SeaEngine)**: C# 엔진 브리지 및 관측(Observation) 변환 로직
+  - `bridge/`: `VectorEnv`, `SeaEngineSession` (IPC 통신 핵심)
+  - `csharp/`: 실제 C# 게임 엔진 소스 코드 및 CLI
+- **[training/](RL_AI/training)**: 강화학습 핵심 알고리즘
+  - `trainer.py`: PPO 트레이너 (비동기 최적화)
+  - `reward.py`: 지능형 보상 함수 (HP 격차 및 효율성 평가)
+  - `storage.py`: 데이터 수집 버퍼
+- **[simulation/](RL_AI/simulation)**: 매치 실행 및 평가 도구
+  - `evaluator.py`: 16방향 정밀 매트릭스 평가기 (Mirror/Counter Match 지원)
+  - `match_runner.py`: 통합 매치 실행 진입점
+- **[models/](RL_AI/models)**: 학습된 최적의 모델(`pt`) 저장소
+- **[log/](RL_AI/log)**: 리포트 및 매치 로그 (자동 압축 관리)
 
-여기서 두 종류를 모두 다룹니다.
+---
 
-- 기존 Python 프로토타입 엔진
-  - `run_manual_match`
-  - `run_random_match`
-  - `run_agent_match`
-- C# SeaEngine 엔진
-  - `run_cs_manual_match`
-  - `run_cs_random_match`
-  - `run_cs_agent_match`
-  - `run_cs_mixed_match`
-  - `run_cs_manual_vs_agent`
+## ⚖️ 밸런스 패치 (Current Baseline)
 
-호환용으로 [cs_match_runner.py](C:/code/capstone-temp/RL_AI/simulation/cs_match_runner.py) 도 남아 있지만, 앞으로는 `match_runner.py` 기준으로 보면 됩니다.
+공정한 학습 환경을 위해 **'귤 덱'**의 수치를 다음과 같이 조정하였습니다.
 
-## DLPC 실행
+| 카드 ID | 이름 | Atk | HP | 비고 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Or_L** | 귤 공주님 | 3 | **7** | 리더 유지력 조정 |
+| **Or_B** | 귤 직장인? | 1 | **3** | 워프 기동 리스크 강화 |
+| **Or_K** | 망상의 기사님 | 2 | **2** | 전투 효율 정상화 |
+| **Or_P** | 귤 요정 | 1 | 1 | 자원 수급 전용 |
 
-기본 notebook:
-- [start.ipynb](C:/code/capstone-temp/RL_AI/start.ipynb)
+---
 
-현재 notebook이 하는 일:
+## 📊 평가 지표 및 분석
 
-1. `dotnet` 확인 / 설치
-2. 현재 notebook kernel에 `torch`, `numpy`, `pytest`가 없으면 설치
-3. `RL_AI.zip` 압축 해제
-4. `SeaEngineCli` 빌드
-5. SeaEngine 기준 학습 전/후 평가 실험 실행
+학습 후 실행되는 **Deep Analytics**를 통해 다음 지표를 추적합니다.
+1. **Mirror Match Win Rate**: 동일 덱 조건에서 상대(Greedy)보다 얼마나 영리한가? (진정한 지능의 척도)
+2. **Counter Match Win Rate**: 덱 상성을 전략으로 극복하고 있는가?
+3. **Avg Interaction Steps**: 게임이 단순 암살이 아닌 정석적인 운영 싸움으로 흘러가는가?
 
-중요:
-- notebook의 Python 셀은 **현재 kernel Python**을 사용합니다
-- 그래서 패키지 설치는 `sys.executable -m pip install -I ...` 기준으로 처리합니다
+---
 
-## 기본 실험 함수
+## 🚀 향후 로드맵 (Roadmap)
 
-현재 주로 쓰는 함수:
-- [run_train_eval_experiment](C:/code/capstone-temp/RL_AI/SeaEngine/experiment.py)
-- [run_checkpoint_training_experiment](C:/code/capstone-temp/RL_AI/SeaEngine/experiment.py)
+1. **gRPC 기반 통신 (RPC 전환)**: 텍스트 기반 JSON 통신을 이진(Binary) RPC로 교체하여 학습 속도를 5배 이상 추가 가속.
+2. **Transformer 아키텍처**: 현재의 MLP 신경망을 기물 간의 관계를 파악하는 **Attention** 구조로 리뉴얼.
+3. **대규모 Self-Play**: 15,000 에피소드 이상의 자기 대전을 통해 '알파고'급 전술 지능 확보.
 
-### `run_train_eval_experiment(...)`
-
-한 번에 아래를 수행합니다.
-
-1. 학습 전 `RL vs Random`
-2. 학습 전 `RL vs Greedy`
-3. mixed opponent 학습
-4. 학습 후 `RL vs Random`
-5. 학습 후 `RL vs Greedy`
-
-진행률은 화면에 출력되고, 요약은 자동으로 저장됩니다.
-
-예시:
-```python
-from RL_AI.SeaEngine.experiment import run_train_eval_experiment
-
-result = run_train_eval_experiment(
-    eval_matches=100,
-    train_episodes=1000,
-    max_turns=100,
-    update_interval=8,
-    seed=7,
-)
-print(result["report_path"])
-```
-
-### `run_checkpoint_training_experiment(...)`
-
-긴 학습을 여러 checkpoint로 나누어 평가합니다.
-
-예시:
-```python
-from RL_AI.SeaEngine.experiment import run_checkpoint_training_experiment
-
-checkpoint = run_checkpoint_training_experiment(
-    eval_matches=100,
-    total_train_episodes=1000,
-    eval_interval=200,
-    max_turns=100,
-    update_interval=8,
-    seed=7,
-)
-print(checkpoint["summary_report_path"])
-```
-
-사람 vs agent 수동 대전 예시:
-```python
-from RL_AI.SeaEngine.agents import SeaEngineGreedyAgent
-from RL_AI.simulation.match_runner import run_cs_manual_vs_agent
-
-run_cs_manual_vs_agent(
-    SeaEngineGreedyAgent(seed=1),
-    human_player="P1",
-    max_turns=100,
-    print_steps=True,
-)
-```
-
-혼합 수동/자동 대전 예시:
-```python
-from RL_AI.SeaEngine.agents import SeaEngineRLAgent
-from RL_AI.simulation.match_runner import run_cs_mixed_match
-
-run_cs_mixed_match(
-    p1_controller=None,  # manual
-    p2_controller=SeaEngineRLAgent(seed=1),
-    max_turns=100,
-    print_steps=True,
-)
-```
-
-## 리포트 저장
-
-저장 위치:
-- [log](C:/code/capstone-temp/RL_AI/log)
-
-주요 파일:
-- `seaengine_evaluation_report_*.txt`
-- `seaengine_train_eval_report_*.txt`
-- `seaengine_checkpoint_training_report_*.txt`
-
-`run_train_eval_experiment(...)` 요약 리포트에는 아래 시간도 함께 저장됩니다.
-
-- `before_random_time_sec`
-- `before_greedy_time_sec`
-- `train_time_sec`
-- `after_random_time_sec`
-- `after_greedy_time_sec`
-- `total_time_sec`
-
-## 현재 학습 결과 해석
-
-2026-04-10 기준으로 확인된 상태:
-
-- `Greedy > Random`
-- `RL > Random`
-- 아직 `RL < Greedy`
-
-즉 RL은 기본 플레이는 배웠지만, 아직 Greedy baseline을 넘지는 못했습니다.
-
-대표적인 최근 결과:
-
-- 학습 전 `RL vs Random`: `78%`
-- 학습 후 `RL vs Random`: `92%`
-- 학습 전 `RL vs Greedy`: `19%`
-- 학습 후 `RL vs Greedy`: `25%`
-
-해석:
-
-- mixed opponent 학습은 실제로 효과가 있음
-- Random 상대 승률은 크게 올랐음
-- Greedy 상대도 개선은 있었지만 아직 충분하지 않음
-
-## observation / action feature 현 상태
-
-현재 [observation.py](C:/code/capstone-temp/RL_AI/SeaEngine/observation.py)는 이전보다 더 많은 정보를 씁니다.
-
-상태 벡터에 들어가는 정보 예:
-
-- 턴 / active player / result
-- 손패 수, 덱 수, 트래시 수
-- 리더 체력 비율과 체력 차이
-- 보드 유닛 수 / 공격력 총합 / 준비된 유닛 수
-- deploy 가능 손패 수
-- skill action 수
-- attack / move action 수
-- 리더에 대한 위협 수
-- 중앙 지역 점유 수
-- 보드 카드별:
-  - 위치
-  - 체력 / 공격력 / 효과 공격력
-  - 이동 / 공격 상태
-  - 상태이상 요약
-  - 적 리더와 거리
-  - 인접 적 수
-  - 들어오는 공격자 수
-  - 실제 공격/이동 action 보유 여부
-
-action feature에 들어가는 정보 예:
-
-- effect type / target type
-- source 유닛 스탯
-- target 유닛 스탯
-- 이동 전후 리더 거리
-- 리더 존 진입 여부
-- 즉시 킬 가능 여부
-- 리더 위협 여부
-- 두 대상 액션 여부
-- 교환 후 생존 가능성 추정
-- 저체력 타깃 여부
-- 손패에서 나가는 행동인지 여부
-
-## 아직 개선 여지가 큰 부분
-
-지금도 개선 여지는 많습니다.
-
-가장 큰 후보:
-
-1. **self-play**
-   - 현재는 `random + greedy` mixed opponent가 기본
-   - 여기에 이전 checkpoint RL을 섞으면 일반화에 더 좋을 가능성이 큼
-
-2. **best checkpoint 선택**
-   - 마지막 모델보다 중간 checkpoint가 더 좋은 경우가 있을 수 있음
-
-3. **leader pressure / tactical exchange feature 추가 정교화**
-   - 현재도 들어가 있지만 더 정교한 “다음 턴 킬 각” 정보를 넣을 수 있음
-
-4. **학습 속도 최적화**
-   - 가장 큰 병목은 GPU보다 **C# 엔진 호출 / snapshot 왕복 비용**일 가능성이 큼
-
-## 학습 속도가 느린 이유와 현재 개선
-
-1000 episode가 40분 안팎 걸리는 가장 큰 이유는, 연산보다도:
-
-- C# SeaEngine 프로세스
-- Python <-> C# 브리지
-- snapshot JSON 직렬화/파싱
-
-비용이 큽니다.
-
-이번에 이미 한 개선:
-
-- [trainer.py](C:/code/capstone-temp/RL_AI/SeaEngine/trainer.py)
-  - episode마다 `SeaEngineSession`을 새로 띄우지 않고, 학습 루프 동안 재사용
-- [evaluator.py](C:/code/capstone-temp/RL_AI/SeaEngine/evaluator.py)
-  - 평가 매치마다 프로세스를 새로 띄우지 않고, 평가 루프 동안 재사용
-
-이건 환경과 상관없이 실제로 시간을 줄이는 방향입니다.
-
-그래도 남는 병목:
-
-- snapshot 전체를 매 step Python으로 넘기는 구조
-- legal action 수가 많을 때 action feature 계산 비용
-- PPO가 step 단위로 모든 action set을 다시 평가하는 비용
-
-## 사람이랑 붙이기
-
-아직 notebook에는 넣지 않았지만, SeaEngine 기준으로 사람 vs agent도 가능합니다.
-
-함수:
-- [run_cs_manual_vs_agent](C:/code/capstone-temp/RL_AI/simulation/match_runner.py)
-- [run_cs_mixed_match](C:/code/capstone-temp/RL_AI/simulation/match_runner.py)
-
-예시:
-```python
-from RL_AI.SeaEngine.agents import SeaEngineGreedyAgent
-from RL_AI.simulation.match_runner import run_cs_manual_vs_agent
-
-run_cs_manual_vs_agent(
-    SeaEngineGreedyAgent(seed=1),
-    human_player="P1",
-    max_turns=100,
-    print_steps=True,
-)
-```
-
-## 용어 메모
-
-- `episode`
-  - 게임 한 판 전체
-- `turn`
-  - 한 플레이어의 턴
-- `step`
-  - 행동 1회
-- `rollout`
-  - 학습용으로 쌓은 플레이 기록
-
-## 현재 권장 다음 단계
-
-지금 상태에서 가장 자연스러운 다음 수순:
-
-1. `checkpoint` 기준으로 best model 찾기
-2. opponent pool에 self-play 추가
-3. Greedy 비중을 높인 mixed training 실험
-4. `RL vs Greedy` 100판 평가 반복
-
-즉 지금 병목은 엔진보다도 **정책 품질과 학습 효율** 쪽입니다.
+---
+**Maintained by Su-seok AI Engineer**
