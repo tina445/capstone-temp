@@ -1,4 +1,4 @@
-# RL_AI
+# RL_AI 
 
 `RL_AI`는 `Call of the King`의 실험/학습 레이어입니다.  
 지금 기준의 실제 게임 로직 source of truth는 Python 프로토타입이 아니라 **C# SeaEngine**이고, Python은 그 위에서:
