@@ -24,7 +24,7 @@ namespace Game.Server.Chess
 
         public void InitGame(string p1 = "1", string p2 = "2")
         {
-            _seaGame = new(new SeaEngine.CardManager.CardLoader(""), new SimpleLogger(), p1, p2);
+            _seaGame = new(new SeaEngine.CardManager.CardLoader(File.ReadAllLines(Setting.DBPath)), new SimpleLogger(), p1, p2);
             _seaGame.Init(
                         "[\"Or_L\", \"Or_B\", \"Or_R\", \"Or_N\", \"Or_P\", \"Or_P\", \"Or_P\"]", 
                         "[\"Cl_L\", \"Cl_B\", \"Cl_R\", \"Cl_N\", \"Cl_P\", \"Cl_P\", \"Cl_P\"]"

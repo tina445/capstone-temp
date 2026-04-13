@@ -8,6 +8,7 @@ using Game.Network;
 using Game.Network.Protocol;
 using Game.Server.Chess;
 using SeaEngine.Common;
+using SeaEngine.Logger;
 
 
 namespace Game.Server
@@ -24,8 +25,6 @@ namespace Game.Server
 
             Session session = new(server);
             ChessGame game  = new(session);
-        
-            Console.WriteLine("q를 입력해 서버 중단");
 
             var cts = new CancellationTokenSource();
 

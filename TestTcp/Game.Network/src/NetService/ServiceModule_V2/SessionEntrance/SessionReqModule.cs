@@ -19,7 +19,6 @@ namespace Game.Network.Service
             _self = context.Self;
             _game = context.Games;
             _host = context.Host;
-            _onRequest = false;
         }
 
         public void RequestEnter(Action<SessionRsp> succ, Action<string> fail)
@@ -56,9 +55,7 @@ namespace Game.Network.Service
         }
 
         private void ReqEnterCallBack(ConnId connId, QueryTaskResult result, Action<SessionRsp> succ, Action<string> fail)
-        {
-            if (!_onRequest) throw new InvalidOperationException();
-            
+        {            
             if (connId != _host.connId) fail.Invoke("Rsp is differnt with host"); 
             else if (result.IsTimeOut) fail.Invoke("Time Out");
             else if (result.IsResponded)
@@ -80,22 +77,30 @@ namespace Game.Network.Service
                     fail.Invoke($"Fail during Reading Rsp. Exception : {e.Message}");
                 }
             }
-            _onRequest = false;
-            return;
         }
 
         private void ReqExitCallBack(ConnId connId, QueryTaskResult result, Action<SessionRsp> succ, Action<string> fail)
         {
-            if (connId != _host.connId)
+            if (connId != _host.connId) fail.Invoke("Rsp is differnt with host"); 
+            else if (result.IsTimeOut) fail.Invoke("Time Out");
+            else if (result.IsResponded)
             {
-                fail.Invoke("Rsp is differnt with host"); 
-                return;
-            }
-
-            if (result.IsResponded)
-            {
-                
-            }
+                try
+                {
+                    PacketReader reader = new(result.AnswerRaw);
+                    SessionRsp rsp = SessionRsp.Codec.Read(ref reader);
+                    if (rsp.type == SessionRspType.Accepted &&
+                        _game.IsSessionActive(rsp.sessionId) && _game.TryExitPlayer(rsp.sessionId, rsp.playerId))
+                    {
+                        _self.sessionWriter.Exit();
+                        succ.Invoke(rsp);
+                    }
+                }
+                catch (Exception e)
+                {
+                    fail.Invoke($"Fail during Reading Rsp. Exception : {e.Message}");
+                }
+            }            
 
         }
 

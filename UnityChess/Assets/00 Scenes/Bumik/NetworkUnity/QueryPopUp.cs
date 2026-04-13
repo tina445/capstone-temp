@@ -8,6 +8,7 @@ using Unity.VisualScripting.AssemblyQualifiedNameParser;
 using UnityEngine;
 using UnityEngine.UI;
 
+
 public class QueryPopUp : MonoBehaviour
 {
     [SerializeField] private Image popUpScreen;
@@ -43,7 +44,7 @@ public class QueryPopUp : MonoBehaviour
     {
         if (int.TryParse(ActionIndexInput.text, out int idx))
         {
-            string uid = GetUidByIndex(_actionList, idx);
+            string uid = (idx == -1)? GetUidByIndex(_actionList, _actionList.Count - 1) : GetUidByIndex(_actionList, idx); 
             NetworkManagerUnity.Instance.Session.Answer(_current_query, Encoding.UTF8.GetBytes(uid));
             popUpScreen.enabled = false;
         }
