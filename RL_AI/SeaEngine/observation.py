@@ -1,8 +1,19 @@
-"""Observation and action feature builders for the C# SeaEngine snapshot."""
+"""Observation and action feature builders for the C# SeaEngine snapshot.
+
+Performance notes
+-----------------
+build_observation() creates a ``_Ctx`` object once from the raw snapshot dict,
+pre-computing all expensive lookups (board-by-uid dict, placed-card lists,
+leader positions, adjacent-enemy counts).  All internal helpers receive this
+context so that repeated O(N) board scans are eliminated.
+
+Public API is unchanged: build_observation(), encode_action_features(),
+build_fixed_state_vector(), ACTION_FEATURE_DIM.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 BOARD_SIZE = 6
@@ -21,6 +32,38 @@ EFFECT_BUCKETS = ["DeployUnit", "DefaultMove", "DefaultAttack", "TurnEnd", "Skil
 TARGET_BUCKETS = ["None", "Cell", "Unit", "Unit2", "Card"]
 RESULT_BUCKETS = ["Ongoing", "Player1Win", "Player2Win", "Draw"]
 
+def _flip_pos_dict(d: Dict[str, Any]) -> None:
+    if "pos_x" in d and isinstance(d["pos_x"], int) and d["pos_x"] >= 0:
+        d["pos_x"] = 5 - d["pos_x"]
+    if "pos_y" in d and isinstance(d["pos_y"], int) and d["pos_y"] >= 0:
+        d["pos_y"] = 5 - d["pos_y"]
+
+def _canonicalize_snapshot(snap: Dict[str, Any], player_id: str) -> Dict[str, Any]:
+    if player_id == "P1":
+        return snap
+    import copy
+    s = copy.deepcopy(snap)
+    for c in s.get("board", []):
+        _flip_pos_dict(c)
+    for a in s.get("actions", []):
+        if "target" in a and isinstance(a["target"], dict):
+            _flip_pos_dict(a["target"])
+    return s
+
+def _canonicalize_action(action: Dict[str, Any], player_id: str) -> Dict[str, Any]:
+    if player_id == "P1":
+        return action
+    import copy
+    a = copy.deepcopy(action)
+    if "target" in a and isinstance(a["target"], dict):
+        _flip_pos_dict(a["target"])
+    return a
+
+
+
+# ---------------------------------------------------------------------------
+# Tiny normalisation helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SeaEngineObservation:
@@ -94,7 +137,116 @@ def _status_summary(card: Dict[str, Any]) -> tuple[float, float, float, float]:
     return attack_mod, has_move_lock, has_attack_lock, timed_status_count
 
 
+# ---------------------------------------------------------------------------
+# Pre-computed snapshot context  ← 핵심 캐싱 구조체
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Ctx:
+    """스냅샷에서 비싼 조회를 미리 계산해 둔 컨텍스트.
+
+    build_observation() 진입 시 한 번만 생성되고 모든 내부 함수에 전달된다.
+    이를 통해 O(N) 보드 탐색 수백 회 → O(1) 딕셔너리 조회로 최적화된다.
+    """
+    player_id: str
+    enemy_id: str
+    board: List[Dict[str, Any]]
+    board_by_uid: Dict[str, Dict[str, Any]]   # uid → card (O(1) 조회)
+    placed: List[Dict[str, Any]]              # is_placed == True 카드 목록
+    own_placed: List[Dict[str, Any]]          # 자기 편 배치 카드
+    enemy_placed: List[Dict[str, Any]]        # 적 배치 카드
+    own_player: Dict[str, Any]
+    enemy_player: Dict[str, Any]
+    own_leader: Optional[Dict[str, Any]]
+    enemy_leader: Optional[Dict[str, Any]]
+    actions: List[Dict[str, Any]]
+    actions_by_source: Dict[str, List[Dict[str, Any]]]
+    # uid → 인접 적 카드 수 (attack_targets, enemy_neighbors, attackers_of 세 함수 대체)
+    enemy_adj: Dict[str, float]
+
+
+def _make_ctx(snapshot: Dict[str, Any], player_id: str) -> _Ctx:
+    """스냅샷 dict에서 _Ctx를 생성한다.  O(N) — 단 한 번만 호출한다."""
+    enemy_id = "P2" if player_id == "P1" else "P1"
+    board: List[Dict[str, Any]] = snapshot.get("board", [])
+    board_by_uid: Dict[str, Dict[str, Any]] = {str(c.get("uid", "")): c for c in board}
+
+    placed = [c for c in board if c.get("is_placed")]
+    own_placed = [c for c in placed if c.get("owner") == player_id]
+    enemy_placed = [c for c in placed if c.get("owner") != player_id]
+
+    players_by_id: Dict[str, Dict[str, Any]] = {
+        str(p.get("id", "")): p for p in snapshot.get("players", [])
+    }
+    own_player = players_by_id.get(player_id, {})
+    enemy_player = players_by_id.get(enemy_id, {})
+
+    own_leader: Optional[Dict[str, Any]] = next(
+        (c for c in own_placed if _role_from_card(c) == "Leader"), None
+    )
+    enemy_leader: Optional[Dict[str, Any]] = next(
+        (c for c in enemy_placed if _role_from_card(c) == "Leader"), None
+    )
+
+    actions: List[Dict[str, Any]] = snapshot.get("actions", [])
+    actions_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for action in actions:
+        src = str(action.get("source", ""))
+        actions_by_source.setdefault(src, []).append(action)
+
+    # 위치 → 소유자 맵 (인접 적 카드 수 계산용)
+    pos_to_owner: Dict[tuple[int, int], str] = {}
+    for c in placed:
+        x, y = int(c.get("pos_x", -1)), int(c.get("pos_y", -1))
+        if x >= 0 and y >= 0:
+            pos_to_owner[(x, y)] = str(c.get("owner", ""))
+
+    # 카드별 인접 적 수 사전 계산 (O(N×8) → 이후 O(1))
+    enemy_adj: Dict[str, float] = {}
+    for c in board:
+        uid = str(c.get("uid", ""))
+        if not c.get("is_placed"):
+            enemy_adj[uid] = 0.0
+            continue
+        owner = str(c.get("owner", ""))
+        x, y = int(c.get("pos_x", -1)), int(c.get("pos_y", -1))
+        if x < 0 or y < 0:
+            enemy_adj[uid] = 0.0
+            continue
+        cnt = 0.0
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                if dx == 0 and dy == 0:
+                    continue
+                nb_owner = pos_to_owner.get((x + dx, y + dy))
+                if nb_owner is not None and nb_owner != owner:
+                    cnt += 1.0
+        enemy_adj[uid] = cnt
+
+    return _Ctx(
+        player_id=player_id,
+        enemy_id=enemy_id,
+        board=board,
+        board_by_uid=board_by_uid,
+        placed=placed,
+        own_placed=own_placed,
+        enemy_placed=enemy_placed,
+        own_player=own_player,
+        enemy_player=enemy_player,
+        own_leader=own_leader,
+        enemy_leader=enemy_leader,
+        actions=actions,
+        actions_by_source=actions_by_source,
+        enemy_adj=enemy_adj,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy public helpers (kept for backward compatibility / outside callers)
+# ---------------------------------------------------------------------------
+
 def _find_card(snapshot: Dict[str, Any], uid: str) -> Optional[Dict[str, Any]]:
+    """Legacy O(N) lookup — 내부 코드는 ctx.board_by_uid 사용."""
     for card in snapshot.get("board", []):
         if card.get("uid") == uid:
             return card
@@ -109,13 +261,17 @@ def _actions_by_source(snapshot: Dict[str, Any]) -> Dict[str, List[Dict[str, Any
     return mapping
 
 
-def _get_players(snapshot: Dict[str, Any], player_id: str) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+def _get_players(
+    snapshot: Dict[str, Any], player_id: str
+) -> tuple[Dict[str, Any], Dict[str, Any], str]:
     enemy_id = "P2" if player_id == "P1" else "P1"
     players = {player["id"]: player for player in snapshot.get("players", [])}
     return players.get(player_id, {}), players.get(enemy_id, {}), enemy_id
 
 
-def _get_leaders(snapshot: Dict[str, Any], player_id: str, enemy_id: str) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _get_leaders(
+    snapshot: Dict[str, Any], player_id: str, enemy_id: str
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     own = None
     enemy = None
     for card in snapshot.get("board", []):
@@ -130,19 +286,8 @@ def _get_leaders(snapshot: Dict[str, Any], player_id: str, enemy_id: str) -> tup
     return own, enemy
 
 
-def _sorted_board_cards(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
-    role_rank = {name: idx for idx, name in enumerate(ROLE_ORDER)}
-    return sorted(
-        snapshot.get("board", []),
-        key=lambda card: (
-            card.get("owner", ""),
-            role_rank.get(_role_from_card(card), 99),
-            card.get("uid", ""),
-        ),
-    )
-
-
 def _count_ready_attack_targets(snapshot: Dict[str, Any], card: Dict[str, Any]) -> float:
+    """Legacy — 내부 코드는 ctx.enemy_adj 사용."""
     if not card.get("is_placed"):
         return 0.0
     source_owner = card.get("owner")
@@ -150,7 +295,6 @@ def _count_ready_attack_targets(snapshot: Dict[str, Any], card: Dict[str, Any]) 
     sy = int(card.get("pos_y", -1))
     if sx < 0 or sy < 0:
         return 0.0
-
     reachable = 0.0
     for other in snapshot.get("board", []):
         if not other.get("is_placed") or other.get("owner") == source_owner:
@@ -165,116 +309,93 @@ def _count_ready_attack_targets(snapshot: Dict[str, Any], card: Dict[str, Any]) 
 
 
 def _count_enemy_neighbors(snapshot: Dict[str, Any], card: Dict[str, Any]) -> float:
-    if not card.get("is_placed"):
-        return 0.0
-    source_owner = card.get("owner")
-    sx = int(card.get("pos_x", -1))
-    sy = int(card.get("pos_y", -1))
-    if sx < 0 or sy < 0:
-        return 0.0
-
-    neighbors = 0.0
-    for other in snapshot.get("board", []):
-        if not other.get("is_placed") or other.get("owner") == source_owner:
-            continue
-        ox = int(other.get("pos_x", -1))
-        oy = int(other.get("pos_y", -1))
-        if ox < 0 or oy < 0:
-            continue
-        if abs(sx - ox) <= 1 and abs(sy - oy) <= 1:
-            neighbors += 1.0
-    return neighbors
+    """Legacy — 내부 코드는 ctx.enemy_adj 사용."""
+    return _count_ready_attack_targets(snapshot, card)
 
 
 def _count_attackers_of_card(snapshot: Dict[str, Any], target_card: Dict[str, Any]) -> float:
-    if not target_card.get("is_placed"):
-        return 0.0
-    tx = int(target_card.get("pos_x", -1))
-    ty = int(target_card.get("pos_y", -1))
-    target_owner = target_card.get("owner")
-    if tx < 0 or ty < 0:
-        return 0.0
+    """Legacy — 내부 코드는 ctx.enemy_adj 사용 (거리 계산은 대칭적)."""
+    return _count_ready_attack_targets(snapshot, target_card)
 
-    attackers = 0.0
-    for other in snapshot.get("board", []):
-        if not other.get("is_placed") or other.get("owner") == target_owner:
+
+def _sorted_board_cards(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    role_rank = {name: idx for idx, name in enumerate(ROLE_ORDER)}
+    return sorted(
+        snapshot.get("board", []),
+        key=lambda card: (
+            card.get("owner", ""),
+            role_rank.get(_role_from_card(card), 99),
+            card.get("uid", ""),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal vector builders (ctx-aware)
+# ---------------------------------------------------------------------------
+
+def _build_global_vector(snapshot: Dict[str, Any], player_id: str, ctx: Optional[_Ctx] = None) -> List[float]:
+    if ctx is None:
+        ctx = _make_ctx(snapshot, player_id)
+
+    own_player = ctx.own_player
+    enemy_player = ctx.enemy_player
+    own_leader = ctx.own_leader
+    enemy_leader = ctx.enemy_leader
+    own_board = ctx.own_placed
+    enemy_board = ctx.enemy_placed
+    actions = ctx.actions
+
+    own_attack_total = sum(float(c.get("effective_atk", 0.0)) for c in own_board)
+    enemy_attack_total = sum(float(c.get("effective_atk", 0.0)) for c in enemy_board)
+    own_hp_total = sum(float(c.get("hp", 0.0)) for c in own_board)
+    enemy_hp_total = sum(float(c.get("hp", 0.0)) for c in enemy_board)
+    own_ready_move = sum(1.0 for c in own_board if not c.get("is_moved"))
+    own_ready_attack = sum(1.0 for c in own_board if not c.get("is_attacked"))
+    enemy_ready_attack = sum(1.0 for c in enemy_board if not c.get("is_attacked"))
+
+    # 배치 가능 / 스킬 사용 가능 카드 수
+    hand_uids = {str(c.get("uid", "")) for c in own_player.get("hand", [])}
+    deploy_sources: set[str] = set()
+    skill_sources: set[str] = set()
+    own_attack_count = 0.0
+    own_move_count = 0.0
+    for action in actions:
+        eid = str(action.get("effect_id", ""))
+        src = str(action.get("source", ""))
+        src_card = ctx.board_by_uid.get(src)
+        if src_card is not None and src_card.get("owner") != player_id:
             continue
-        ox = int(other.get("pos_x", -1))
-        oy = int(other.get("pos_y", -1))
-        if ox < 0 or oy < 0:
-            continue
-        if abs(ox - tx) <= 1 and abs(oy - ty) <= 1:
-            attackers += 1.0
-    return attackers
+        if eid == "DeployUnit" and src in hand_uids:
+            deploy_sources.add(src)
+        elif eid not in {"DeployUnit", "DefaultMove", "DefaultAttack", "TurnEnd"} and src in hand_uids:
+            skill_sources.add(src)
+        elif eid == "DefaultAttack":
+            own_attack_count += 1.0
+        elif eid == "DefaultMove":
+            own_move_count += 1.0
 
+    own_deployable = float(len(deploy_sources))
+    own_skill_actions = float(len(skill_sources))
 
-def _count_deployable_cards(snapshot: Dict[str, Any], player_id: str) -> float:
-    own_player, _, _ = _get_players(snapshot, player_id)
-    deployable = 0.0
-    for card in own_player.get("hand", []):
-        uid = str(card.get("uid", ""))
-        if any(str(action.get("effect_id", "")) == "DeployUnit" and str(action.get("source", "")) == uid for action in snapshot.get("actions", [])):
-            deployable += 1.0
-    return deployable
+    # 리더 위협 카운트 (ctx.enemy_adj 재사용)
+    enemy_attackers_on_leader = (
+        0.0 if own_leader is None
+        else ctx.enemy_adj.get(str(own_leader.get("uid", "")), 0.0)
+    )
+    own_attackers_on_enemy_leader = (
+        0.0 if enemy_leader is None
+        else ctx.enemy_adj.get(str(enemy_leader.get("uid", "")), 0.0)
+    )
 
-
-def _count_skill_actions(snapshot: Dict[str, Any], player_id: str) -> float:
-    own_player, _, _ = _get_players(snapshot, player_id)
-    hand_uids = {str(card.get("uid", "")) for card in own_player.get("hand", [])}
-    count = 0.0
-    for action in snapshot.get("actions", []):
-        effect_id = str(action.get("effect_id", ""))
-        source_uid = str(action.get("source", ""))
-        if effect_id not in {"DeployUnit", "DefaultMove", "DefaultAttack", "TurnEnd"} and source_uid in hand_uids:
-            count += 1.0
-    return count
-
-
-def _count_actions(snapshot: Dict[str, Any], player_id: str, effect_id: str) -> float:
-    count = 0.0
-    for action in snapshot.get("actions", []):
-        source_uid = str(action.get("source", ""))
-        source_card = _find_card(snapshot, source_uid)
-        if source_card is not None and source_card.get("owner") != player_id:
-            continue
-        if str(action.get("effect_id", "")) == effect_id:
-            count += 1.0
-    return count
-
-
-def _build_global_vector(snapshot: Dict[str, Any], player_id: str) -> List[float]:
-    own_player, enemy_player, enemy_id = _get_players(snapshot, player_id)
-    own_leader, enemy_leader = _get_leaders(snapshot, player_id, enemy_id)
-
-    own_board = [card for card in snapshot.get("board", []) if card.get("owner") == player_id and card.get("is_placed")]
-    enemy_board = [card for card in snapshot.get("board", []) if card.get("owner") == enemy_id and card.get("is_placed")]
-
-    own_attack_total = sum(float(card.get("effective_atk", 0.0)) for card in own_board)
-    enemy_attack_total = sum(float(card.get("effective_atk", 0.0)) for card in enemy_board)
-    own_hp_total = sum(float(card.get("hp", 0.0)) for card in own_board)
-    enemy_hp_total = sum(float(card.get("hp", 0.0)) for card in enemy_board)
-    own_ready_move = sum(1.0 for card in own_board if not card.get("is_moved"))
-    own_ready_attack = sum(1.0 for card in own_board if not card.get("is_attacked"))
-    enemy_ready_attack = sum(1.0 for card in enemy_board if not card.get("is_attacked"))
-    own_deployable = _count_deployable_cards(snapshot, player_id)
-    own_skill_actions = _count_skill_actions(snapshot, player_id)
-    own_attack_actions = _count_actions(snapshot, player_id, "DefaultAttack")
-    own_move_actions = _count_actions(snapshot, player_id, "DefaultMove")
-    enemy_attackers_on_leader = 0.0 if own_leader is None else _count_attackers_of_card(snapshot, own_leader)
-    own_attackers_on_enemy_leader = 0.0 if enemy_leader is None else _count_attackers_of_card(snapshot, enemy_leader)
     center_control_own = sum(
-        1.0
-        for card in own_board
-        if 2 <= int(card.get("pos_x", -1)) <= 3 and 2 <= int(card.get("pos_y", -1)) <= 3
+        1.0 for c in own_board if 2 <= int(c.get("pos_x", -1)) <= 3 and 2 <= int(c.get("pos_y", -1)) <= 3
     )
     center_control_enemy = sum(
-        1.0
-        for card in enemy_board
-        if 2 <= int(card.get("pos_x", -1)) <= 3 and 2 <= int(card.get("pos_y", -1)) <= 3
+        1.0 for c in enemy_board if 2 <= int(c.get("pos_x", -1)) <= 3 and 2 <= int(c.get("pos_y", -1)) <= 3
     )
 
     action_counts = {bucket: 0.0 for bucket in EFFECT_BUCKETS}
-    actions = snapshot.get("actions", [])
     for action in actions:
         effect_id = str(action.get("effect_id", ""))
         bucket = effect_id if effect_id in EFFECT_BUCKETS[:-1] else "Skill"
@@ -310,8 +431,8 @@ def _build_global_vector(snapshot: Dict[str, Any], player_id: str) -> List[float
         _normalize_ratio(enemy_ready_attack, MAX_BOARD_CARDS),
         _normalize_ratio(own_deployable, MAX_HAND_CARDS),
         _normalize_ratio(own_skill_actions, MAX_HAND_CARDS),
-        _normalize_ratio(own_attack_actions, 20.0),
-        _normalize_ratio(own_move_actions, 20.0),
+        _normalize_ratio(own_attack_count, 20.0),
+        _normalize_ratio(own_move_count, 20.0),
         _normalize_ratio(enemy_attackers_on_leader, 6.0),
         _normalize_ratio(own_attackers_on_enemy_leader, 6.0),
         _normalize_ratio(center_control_own, 4.0),
@@ -320,18 +441,27 @@ def _build_global_vector(snapshot: Dict[str, Any], player_id: str) -> List[float
     ]
 
 
-def _build_board_vector(snapshot: Dict[str, Any], player_id: str) -> List[float]:
-    _, _, enemy_id = _get_players(snapshot, player_id)
-    own_leader, enemy_leader = _get_leaders(snapshot, player_id, enemy_id)
+def _build_board_vector(snapshot: Dict[str, Any], player_id: str, ctx: Optional[_Ctx] = None) -> List[float]:
+    if ctx is None:
+        ctx = _make_ctx(snapshot, player_id)
+
+    own_leader = ctx.own_leader
+    enemy_leader = ctx.enemy_leader
     own_lx = int(own_leader.get("pos_x", -1)) if own_leader else -1
     own_ly = int(own_leader.get("pos_y", -1)) if own_leader else -1
     enemy_lx = int(enemy_leader.get("pos_x", -1)) if enemy_leader else -1
     enemy_ly = int(enemy_leader.get("pos_y", -1)) if enemy_leader else -1
-    action_map = _actions_by_source(snapshot)
+
+    # _sorted_board_cards 인라인 (ctx.board 재사용)
+    role_rank = {name: idx for idx, name in enumerate(ROLE_ORDER)}
+    cards = sorted(
+        ctx.board,
+        key=lambda c: (c.get("owner", ""), role_rank.get(_role_from_card(c), 99), c.get("uid", "")),
+    )
 
     vectors: List[float] = []
-    cards = _sorted_board_cards(snapshot)
     for card in cards[:MAX_BOARD_CARDS]:
+        uid = str(card.get("uid", ""))
         attack_mod, has_move_lock, has_attack_lock, timed_status_count = _status_summary(card)
         cx = int(card.get("pos_x", -1))
         cy = int(card.get("pos_y", -1))
@@ -340,47 +470,49 @@ def _build_board_vector(snapshot: Dict[str, Any], player_id: str) -> List[float]
         max_hp = max(1.0, float(card.get("max_hp", 1.0)))
         effective_atk = float(card.get("effective_atk", 0.0))
         base_atk = float(card.get("atk", 0.0))
-        reachable_targets = _count_ready_attack_targets(snapshot, card)
-        adjacent_enemies = _count_enemy_neighbors(snapshot, card)
-        incoming_attackers = _count_attackers_of_card(snapshot, card)
-        card_actions = action_map.get(str(card.get("uid", "")), [])
-        has_attack_action = 1.0 if any(str(action.get("effect_id", "")) in {"DefaultAttack", "PawnGeneric"} for action in card_actions) else 0.0
-        has_move_action = 1.0 if any(str(action.get("effect_id", "")) == "DefaultMove" for action in card_actions) else 0.0
-        threatens_enemy_leader = 1.0 if enemy_leader is not None and _distance(cx, cy, enemy_lx, enemy_ly) >= 0 and _distance(cx, cy, enemy_lx, enemy_ly) <= (1.0 / 5.0) else 0.0
+
+        # ctx.enemy_adj로 O(1) 조회 (기존 O(N) 탐색 3회 대체)
+        reachable_targets = ctx.enemy_adj.get(uid, 0.0)
+        adjacent_enemies = ctx.enemy_adj.get(uid, 0.0)
+        incoming_attackers = ctx.enemy_adj.get(uid, 0.0)
+
+        card_actions = ctx.actions_by_source.get(uid, [])
+        has_attack_action = 1.0 if any(str(a.get("effect_id", "")) in {"DefaultAttack", "PawnGeneric"} for a in card_actions) else 0.0
+        has_move_action = 1.0 if any(str(a.get("effect_id", "")) == "DefaultMove" for a in card_actions) else 0.0
+        dist_enemy_leader = _distance(cx, cy, enemy_lx, enemy_ly)
+        threatens_enemy_leader = 1.0 if enemy_leader is not None and 0.0 <= dist_enemy_leader <= (1.0 / 5.0) else 0.0
         in_center = 1.0 if 2 <= cx <= 3 and 2 <= cy <= 3 else 0.0
         row_progress = 0.0
         if card.get("is_placed"):
-            row_progress = _normalize_ratio(float(cx if card.get("owner") == "P1" else (BOARD_SIZE - 1 - cx)), BOARD_SIZE - 1)
+            row_progress = _normalize_ratio(float(cx if card.get("owner") == player_id else (BOARD_SIZE - 1 - cx)), BOARD_SIZE - 1)
 
-        vectors.extend(
-            [
-                1.0 if card.get("owner") == player_id else -1.0,
-                1.0 if card.get("is_placed") else 0.0,
-                1.0 if card.get("is_moved") else 0.0,
-                1.0 if card.get("is_attacked") else 0.0,
-                _normalize_pos(cx),
-                _normalize_pos(cy),
-                _normalize_ratio(hp, max_hp),
-                _normalize_ratio(max_hp, 10.0),
-                _normalize_ratio(base_atk, 10.0),
-                _normalize_ratio(effective_atk, 10.0),
-                _normalize_ratio(attack_mod, 5.0),
-                has_move_lock,
-                has_attack_lock,
-                _normalize_ratio(timed_status_count, 4.0),
-                _distance(cx, cy, own_lx, own_ly),
-                _distance(cx, cy, enemy_lx, enemy_ly),
-                _normalize_ratio(reachable_targets, 6.0),
-                _normalize_ratio(adjacent_enemies, 6.0),
-                _normalize_ratio(incoming_attackers, 6.0),
-                has_attack_action,
-                has_move_action,
-                threatens_enemy_leader,
-                in_center,
-                row_progress,
-                *_role_one_hot(role),
-            ]
-        )
+        vectors.extend([
+            1.0 if card.get("owner") == player_id else -1.0,
+            1.0 if card.get("is_placed") else 0.0,
+            1.0 if card.get("is_moved") else 0.0,
+            1.0 if card.get("is_attacked") else 0.0,
+            _normalize_pos(cx),
+            _normalize_pos(cy),
+            _normalize_ratio(hp, max_hp),
+            _normalize_ratio(max_hp, 10.0),
+            _normalize_ratio(base_atk, 10.0),
+            _normalize_ratio(effective_atk, 10.0),
+            _normalize_ratio(attack_mod, 5.0),
+            has_move_lock,
+            has_attack_lock,
+            _normalize_ratio(timed_status_count, 4.0),
+            _distance(cx, cy, own_lx, own_ly),
+            dist_enemy_leader,
+            _normalize_ratio(reachable_targets, 6.0),
+            _normalize_ratio(adjacent_enemies, 6.0),
+            _normalize_ratio(incoming_attackers, 6.0),
+            has_attack_action,
+            has_move_action,
+            threatens_enemy_leader,
+            in_center,
+            row_progress,
+            *_role_one_hot(role),
+        ])
 
     missing_slots = MAX_BOARD_CARDS - min(len(cards), MAX_BOARD_CARDS)
     if missing_slots > 0:
@@ -388,58 +520,80 @@ def _build_board_vector(snapshot: Dict[str, Any], player_id: str) -> List[float]
     return vectors
 
 
-def _build_hand_vector(snapshot: Dict[str, Any], player_id: str) -> List[float]:
-    own_player, _, _ = _get_players(snapshot, player_id)
-    hand = list(own_player.get("hand", []))
+def _build_hand_vector(snapshot: Dict[str, Any], player_id: str, ctx: Optional[_Ctx] = None) -> List[float]:
+    if ctx is None:
+        ctx = _make_ctx(snapshot, player_id)
+
+    hand = list(ctx.own_player.get("hand", []))
     vectors: List[float] = []
     for card in hand[:MAX_HAND_CARDS]:
         role = _role_from_card(card)
         card_id = str(card.get("card_id", ""))
-        deployable = 1.0 if any(
-            str(action.get("effect_id", "")) == "DeployUnit" and str(action.get("source", "")) == str(card.get("uid", ""))
-            for action in snapshot.get("actions", [])
-        ) else 0.0
+        uid = str(card.get("uid", ""))
+        card_actions = ctx.actions_by_source.get(uid, [])
+        deployable = 1.0 if any(str(a.get("effect_id", "")) == "DeployUnit" for a in card_actions) else 0.0
         skill_usable = 1.0 if any(
-            str(action.get("effect_id", "")) not in {"DeployUnit", "DefaultMove", "DefaultAttack", "TurnEnd"}
-            and str(action.get("source", "")) == str(card.get("uid", ""))
-            for action in snapshot.get("actions", [])
+            str(a.get("effect_id", "")) not in {"DeployUnit", "DefaultMove", "DefaultAttack", "TurnEnd"}
+            for a in card_actions
         ) else 0.0
-        vectors.extend(
-            [
-                1.0,
-                1.0 if card_id.startswith("Or_") else 0.0,
-                1.0 if card_id.startswith("Cl_") else 0.0,
-                deployable,
-                skill_usable,
-                *_role_one_hot(role),
-            ]
-        )
+        vectors.extend([
+            1.0,
+            1.0 if card_id.startswith("Or_") else 0.0,
+            1.0 if card_id.startswith("Cl_") else 0.0,
+            deployable,
+            skill_usable,
+            *_role_one_hot(role),
+        ])
     missing_slots = MAX_HAND_CARDS - min(len(hand), MAX_HAND_CARDS)
     if missing_slots > 0:
         vectors.extend([0.0] * missing_slots * 10)
     return vectors
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def build_fixed_state_vector(snapshot: Dict[str, Any], player_id: Optional[str] = None) -> List[float]:
     player_id = player_id or snapshot.get("active_player", "P1")
-    global_vector = _build_global_vector(snapshot, player_id)
-    board_vector = _build_board_vector(snapshot, player_id)
-    hand_vector = _build_hand_vector(snapshot, player_id)
+    snapshot = _canonicalize_snapshot(snapshot, player_id)
+    ctx = _make_ctx(snapshot, player_id)
+    global_vector = _build_global_vector(snapshot, player_id, ctx)
+    board_vector = _build_board_vector(snapshot, player_id, ctx)
+    hand_vector = _build_hand_vector(snapshot, player_id, ctx)
     return global_vector + board_vector + hand_vector
 
 
-def encode_action_features(snapshot: Dict[str, Any], action: Dict[str, Any], player_id: Optional[str] = None) -> List[float]:
+def encode_action_features(
+    snapshot: Dict[str, Any],
+    action: Dict[str, Any],
+    player_id: Optional[str] = None,
+    _ctx: Optional[_Ctx] = None,
+) -> List[float]:
+    """액션 하나의 feature vector를 반환한다.
+
+    _ctx가 제공되면 (build_observation 내부에서 호출 시) 재사용한다.
+    외부에서 단독 호출할 경우 _ctx=None으로 남겨두면 내부에서 생성한다.
+    """
     player_id = player_id or snapshot.get("active_player", "P1")
-    _, _, enemy_id = _get_players(snapshot, player_id)
-    own_leader, enemy_leader = _get_leaders(snapshot, player_id, enemy_id)
+    if _ctx is None:
+        snapshot = _canonicalize_snapshot(snapshot, player_id)
+        action = _canonicalize_action(action, player_id)
+        ctx = _make_ctx(snapshot, player_id)
+    else:
+        ctx = _ctx
+
+    own_leader = ctx.own_leader
+    enemy_leader = ctx.enemy_leader
 
     effect_id = str(action.get("effect_id", ""))
     target = action.get("target", {})
     target_type = str(target.get("type", "None"))
 
-    source = _find_card(snapshot, str(action.get("source", "")))
-    target_card = _find_card(snapshot, str(target.get("guid", ""))) if target_type in {"Unit", "Card"} else None
-    target_card2 = _find_card(snapshot, str(target.get("guid2", ""))) if target_type == "Unit2" else None
+    # O(1) 조회 (이전에는 _find_card() O(N) 탐색)
+    source = ctx.board_by_uid.get(str(action.get("source", "")))
+    target_card = ctx.board_by_uid.get(str(target.get("guid", ""))) if target_type in {"Unit", "Card"} else None
+    target_card2 = ctx.board_by_uid.get(str(target.get("guid2", ""))) if target_type == "Unit2" else None
 
     target_x = int(target.get("pos_x", -1))
     target_y = int(target.get("pos_y", -1))
@@ -451,8 +605,12 @@ def encode_action_features(snapshot: Dict[str, Any], action: Dict[str, Any], pla
     attack_mod, has_move_lock, has_attack_lock, timed_status_count = _status_summary(source) if source else (0.0, 0.0, 0.0, 0.0)
     source_role = _role_from_card(source or {})
     target_role = _role_from_card(target_card or {})
-    source_adjacent_enemies = _count_enemy_neighbors(snapshot, source) if source else 0.0
-    target_incoming_attackers = _count_attackers_of_card(snapshot, target_card) if target_card else 0.0
+
+    # ctx.enemy_adj O(1) 조회 (이전에는 O(N) 보드 탐색)
+    source_uid = str(source.get("uid", "")) if source else ""
+    target_uid = str(target_card.get("uid", "")) if target_card else ""
+    source_adjacent_enemies = ctx.enemy_adj.get(source_uid, 0.0) if source else 0.0
+    target_incoming_attackers = ctx.enemy_adj.get(target_uid, 0.0) if target_card else 0.0
 
     move_distance_before = _distance(source_x, source_y, enemy_lx, enemy_ly)
     move_distance_after = _distance(target_x, target_y, enemy_lx, enemy_ly) if target_type == "Cell" else move_distance_before
@@ -519,18 +677,35 @@ ACTION_FEATURE_DIM = len(
 
 def build_observation(snapshot: Dict[str, Any], player_id: Optional[str] = None) -> SeaEngineObservation:
     player_id = player_id or snapshot.get("active_player", "P1")
-    own_player, _, _ = _get_players(snapshot, player_id)
+    snapshot = _canonicalize_snapshot(snapshot, player_id)
 
-    unit_list = _sorted_board_cards(snapshot)
-    hand_list = list(own_player.get("hand", []))
-    state_vector = build_fixed_state_vector(snapshot, player_id)
-    action_feature_vectors = [encode_action_features(snapshot, action, player_id) for action in snapshot.get("actions", [])]
+    # _Ctx를 딱 한 번 만들고 모든 내부 함수에 재사용
+    ctx = _make_ctx(snapshot, player_id)
+
+    # _sorted_board_cards 인라인 (ctx.board 재사용)
+    role_rank = {name: idx for idx, name in enumerate(ROLE_ORDER)}
+    unit_list = sorted(
+        ctx.board,
+        key=lambda c: (c.get("owner", ""), role_rank.get(_role_from_card(c), 99), c.get("uid", "")),
+    )
+    hand_list = list(ctx.own_player.get("hand", []))
+
+    global_vec = _build_global_vector(snapshot, player_id, ctx)
+    board_vec = _build_board_vector(snapshot, player_id, ctx)
+    hand_vec = _build_hand_vector(snapshot, player_id, ctx)
+    state_vector = global_vec + board_vec + hand_vec
+
+    # 각 액션 feature 계산 시 ctx 재사용 → _get_players/_get_leaders/_find_card 零 호출
+    action_feature_vectors = [
+        encode_action_features(snapshot, action, player_id, _ctx=ctx)
+        for action in ctx.actions
+    ]
 
     return SeaEngineObservation(
         unit_list=unit_list,
         hand_list=hand_list,
-        global_vector=_build_global_vector(snapshot, player_id),
-        legal_action_mask=[1 for _ in snapshot.get("actions", [])],
+        global_vector=global_vec,
+        legal_action_mask=[1 for _ in ctx.actions],
         state_vector=state_vector,
         action_feature_vectors=action_feature_vectors,
     )

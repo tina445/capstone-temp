@@ -1,24 +1,40 @@
+"""PPO trainer for SeaEngine-backed RL agents (Asynchronous version).
+Updated with 200 episode logging and internal storage path.
+"""
+
 from __future__ import annotations
 
-# PPO 학습 루프를 담당하는 파일
-# rollout 수집, terminal reward 부여, return/advantage 계산, PPO 업데이트를 한 곳에서 연결한다.
-
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+import asyncio
+import random
+from typing import Callable, Dict, List, Optional, Sequence, Any
 
 import torch
 
-from RL_AI.agents.base_agent import BaseAgent
-from RL_AI.agents.greedy_agent import GreedyAgent
-from RL_AI.agents.random_agent import RandomAgent
-from RL_AI.agents.rl_agent import RLAgent
-from RL_AI.analysis.reports import build_win_rate_report
-from RL_AI.game_engine.engine import initialize_main_phase
-from RL_AI.game_engine.rules import get_legal_actions
-from RL_AI.game_engine.state import GameResult, PlayerID, create_initial_game_state, load_supported_card_db
-from RL_AI.training.evaluator import evaluate_agents
+from RL_AI.SeaEngine.action_adapter import choose_action_with_agent
+from RL_AI.agents.agents import SeaEngineAgent, SeaEngineGreedyAgent, SeaEngineRLAgent, SeaEngineRandomAgent
+from RL_AI.SeaEngine.bridge.seaengine_session import SeaEngineSession
+from RL_AI.SeaEngine.bridge.vector_env import VectorSeaEngineEnv
+from RL_AI.simulation.evaluator import evaluate_agents_async
 from RL_AI.training.reward import terminal_reward_for_player
-from RL_AI.training.storage import RolloutBuffer, RolloutStep
+from RL_AI.analysis.reports import build_win_rate_report
+from RL_AI.training.storage import RolloutBuffer, RolloutStep # storage 경로 변경됨
+
+
+def safe_run(coro):
+    """주피터 노트북 환경에서도 안전하게 비동기 코드를 실행하는 헬퍼."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    if loop.is_running():
+        import nest_asyncio
+        nest_asyncio.apply()
+        return loop.run_until_complete(coro)
+    else:
+        return loop.run_until_complete(coro)
 
 
 @dataclass
@@ -28,13 +44,14 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     value_loss_coef: float = 0.5
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.05
     update_epochs: int = 4
     max_grad_norm: float = 0.5
+    mini_batch_size: int = 64
 
 
-class PPOTrainer:
-    def __init__(self, agent: RLAgent, config: Optional[PPOConfig] = None) -> None:
+class SeaEnginePPOTrainer:
+    def __init__(self, agent: SeaEngineRLAgent, config: Optional[PPOConfig] = None) -> None:
         self.agent = agent
         self.config = PPOConfig() if config is None else config
 
@@ -42,61 +59,100 @@ class PPOTrainer:
         self,
         episode_id: int,
         *,
-        opponent_agent: Optional[BaseAgent] = None,
-        opponent_pool: Optional[Sequence[BaseAgent]] = None,
+        opponent_agent: Optional[SeaEngineAgent] = None,
+        opponent_pool: Optional[Sequence[SeaEngineAgent]] = None,
         seed: Optional[int] = None,
-    ) -> BaseAgent:
+    ) -> SeaEngineAgent:
         if opponent_pool:
-            return opponent_pool[episode_id % len(opponent_pool)]
+            return random.choice(list(opponent_pool))
         if opponent_agent is not None:
             return opponent_agent
-        return RandomAgent(seed=seed)
+        return SeaEngineRandomAgent(seed=seed)
+
+    def _maybe_add_self_play_snapshot(
+        self,
+        opponent_pool: list[SeaEngineAgent],
+        *,
+        update_count: int,
+        snapshot_interval_updates: int,
+        max_self_play_opponents: int,
+        seed: Optional[int] = None,
+    ) -> None:
+        if snapshot_interval_updates <= 0 or max_self_play_opponents <= 0:
+            return
+        if update_count % snapshot_interval_updates != 0:
+            return
+        snapshot_name = f"selfplay_u{update_count}"
+        snapshot_agent = self.agent.clone_as_opponent(
+            name=snapshot_name,
+            sample_actions=False,
+            seed=seed,
+        )
+        opponent_pool.append(snapshot_agent)
+        self_play_agents = [agent for agent in opponent_pool if agent.name.startswith("selfplay_")]
+        overflow = len(self_play_agents) - max_self_play_opponents
+        if overflow <= 0:
+            return
+        trimmed_pool: list[SeaEngineAgent] = []
+        removed = 0
+        for agent in opponent_pool:
+            if removed < overflow and agent.name.startswith("selfplay_"):
+                removed += 1
+                continue
+            trimmed_pool.append(agent)
+        opponent_pool[:] = trimmed_pool
 
     def _extend_buffer(self, dst: RolloutBuffer, src: RolloutBuffer) -> None:
         for step in src.steps:
             dst.add_step(step)
 
+    def _assign_terminal_rewards(self, buffer: RolloutBuffer, result: str, final_snapshot: Optional[Dict[str, Any]] = None) -> None:
+        grouped = buffer.trajectory_groups()
+        for (_, player_idx), indices in grouped.items():
+            if not indices:
+                continue
+            player_id = "P1" if player_idx == 0 else "P2"
+            terminal_reward = terminal_reward_for_player(result, player_id, final_snapshot)
+            last_index = indices[-1]
+            for index in indices:
+                buffer.steps[index].reward = 0.0
+                buffer.steps[index].done = False
+            buffer.steps[last_index].reward = terminal_reward
+            buffer.steps[last_index].done = True
+
     def collect_episode(
         self,
         *,
         episode_id: int = 0,
-        opponent_agent: Optional[BaseAgent] = None,
-        p1_world: int = 2,
-        p2_world: int = 6,
-        card_data_path: str = "Cards.csv",
-        seed: Optional[int] = None,
-        first_player: Optional[PlayerID] = None,
-        max_steps: int = 500,
-        max_turns: Optional[int] = None,
+        opponent_agent: Optional[SeaEngineAgent] = None,
+        session: Optional[SeaEngineSession] = None,
+        card_data_path: Optional[str] = None,
+        player1_deck: str = "",
+        player2_deck: str = "",
+        max_turns: int = 100,
+        learning_player_id: str = "P1",
     ) -> Dict[str, object]:
-        card_db = load_supported_card_db(card_data_path=card_data_path)
-        state = create_initial_game_state(
-            p1_world=p1_world,
-            p2_world=p2_world,
-            card_data_path=card_data_path,
-            seed=seed,
-            first_player=first_player,
-        )
-        state = initialize_main_phase(state, card_db)
+        owns_session = session is None
+        if session is None:
+            session = SeaEngineSession(card_data_path=card_data_path)
+            session.start()
+        try:
+            snapshot = session.init_game(player1_deck=player1_deck, player2_deck=player2_deck)
+            buffer = RolloutBuffer()
+            opponent = opponent_agent if opponent_agent is not None else SeaEngineRandomAgent()
+            steps = 0
+            opponent_auto_strategy: Optional[str] = getattr(opponent, "auto_play_strategy", None)
 
-        buffer = RolloutBuffer()
-        opponent = opponent_agent if opponent_agent is not None else RandomAgent(seed=seed)
+            while snapshot["result"] == "Ongoing" and snapshot["turn"] <= max_turns:
+                legal_actions = snapshot.get("actions", [])
+                if not legal_actions: break
+                acting_player = snapshot["active_player"]
 
-        steps = 0
-        while not state.is_terminal() and steps < max_steps and (max_turns is None or state.turn <= max_turns):
-            legal_actions = get_legal_actions(state, card_db=card_db)
-            if not legal_actions:
-                break
-
-            acting_player = state.active_player
-            acting_agent: BaseAgent = self.agent if acting_player == PlayerID.P1 else opponent
-
-            if acting_agent is self.agent:
-                output = self.agent.compute_policy_output(state, legal_actions, card_db=card_db)
-                buffer.add_step(
-                    RolloutStep(
+                if acting_player == learning_player_id:
+                    output = self.agent.compute_policy_output(snapshot, legal_actions)
+                    buffer.add_step(RolloutStep(
                         episode_id=episode_id,
-                        player_id=int(acting_player),
+                        player_id=0 if learning_player_id == "P1" else 1,
                         state_vector=output.state_vector,
                         action_feature_vectors=output.action_feature_vectors,
                         chosen_action_index=output.action_index,
@@ -104,25 +160,21 @@ class PPOTrainer:
                         done=False,
                         old_log_prob=output.log_prob,
                         old_value=output.value,
-                    )
-                )
-                action = output.action
-            else:
-                _, action = acting_agent.select_action(state, legal_actions, card_db=card_db)
+                    ))
+                    if opponent_auto_strategy is not None:
+                        snapshot = session.apply_and_auto_play(output.action["uid"], learning_player_id, opponent_auto_strategy)
+                    else:
+                        snapshot = session.apply_action(output.action["uid"])
+                    steps += 1
+                else:
+                    _, action = choose_action_with_agent(opponent, snapshot)
+                    snapshot = session.apply_action(action["uid"])
+                    steps += 1
 
-            from RL_AI.game_engine.engine import apply_action  # local import to avoid widening module coupling
-            state = apply_action(state, action, card_db)
-            steps += 1
-
-        self._assign_terminal_rewards(buffer, state.result)
-        buffer.compute_returns_and_advantages(self.config.gamma, self.config.gae_lambda)
-
-        return {
-            "buffer": buffer,
-            "result": state.result,
-            "steps": steps,
-            "final_turn": state.turn,
-        }
+            self._assign_terminal_rewards(buffer, str(snapshot["result"]), snapshot)
+            return {"buffer": buffer, "result": snapshot["result"], "steps": steps, "final_turn": snapshot["turn"]}
+        finally:
+            if owns_session: session.close()
 
     def update_from_buffer(self, buffer: RolloutBuffer) -> Dict[str, float]:
         if len(buffer) == 0:
@@ -130,48 +182,46 @@ class PPOTrainer:
 
         if self.agent.optimizer is None:
             self.agent.ensure_model(state_dim=len(buffer.steps[0].state_vector))
-        assert self.agent.optimizer is not None
+        assert self.agent.optimizer is not None and self.agent.model is not None
 
+        buffer.compute_returns_and_advantages(self.config.gamma, self.config.gae_lambda)
         normalized_advantages = buffer.normalized_advantages()
+        adv_list: List[float] = list(normalized_advantages)
+
         policy_loss_total = 0.0
         value_loss_total = 0.0
         entropy_total = 0.0
         update_count = 0
+        mini_batch_size = max(1, self.config.mini_batch_size)
 
         for _ in range(self.config.update_epochs):
-            for step, norm_advantage in zip(buffer.steps, normalized_advantages):
-                old_log_prob = torch.tensor(step.old_log_prob, dtype=torch.float32, device=self.agent.device)
-                advantage = torch.tensor(norm_advantage, dtype=torch.float32, device=self.agent.device)
-                return_value = torch.tensor(step.return_value, dtype=torch.float32, device=self.agent.device)
+            indices = list(range(len(buffer.steps)))
+            random.shuffle(indices)
+            for batch_start in range(0, len(indices), mini_batch_size):
+                batch_indices = indices[batch_start : batch_start + mini_batch_size]
+                batch_states = [buffer.steps[idx].state_vector for idx in batch_indices]
+                batch_actions = [buffer.steps[idx].action_feature_vectors for idx in batch_indices]
+                batch_chosen = [buffer.steps[idx].chosen_action_index for idx in batch_indices]
+                
+                batch_old_log_probs = torch.tensor([buffer.steps[idx].old_log_prob for idx in batch_indices], dtype=torch.float32, device=self.agent.device)
+                batch_advantages = torch.tensor([adv_list[idx] for idx in batch_indices], dtype=torch.float32, device=self.agent.device)
+                batch_returns = torch.tensor([buffer.steps[idx].return_value for idx in batch_indices], dtype=torch.float32, device=self.agent.device)
 
-                log_prob, entropy, value = self.agent.evaluate_action_set(
-                    step.state_vector,
-                    step.action_feature_vectors,
-                    step.chosen_action_index,
-                )
+                log_probs, entropies, values = self.agent.evaluate_action_set_batched(batch_states, batch_actions, batch_chosen)
+                ratios = torch.exp(log_probs - batch_old_log_probs)
+                clipped_ratios = torch.clamp(ratios, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon)
+                policy_losses = -torch.min(ratios * batch_advantages, clipped_ratios * batch_advantages)
+                value_losses = (values - batch_returns).pow(2)
 
-                ratio = torch.exp(log_prob - old_log_prob)
-                clipped_ratio = torch.clamp(
-                    ratio,
-                    1.0 - self.config.clip_epsilon,
-                    1.0 + self.config.clip_epsilon,
-                )
-                policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage)
-                value_loss = (value - return_value).pow(2)
-                loss = (
-                    policy_loss
-                    + self.config.value_loss_coef * value_loss
-                    - self.config.entropy_coef * entropy
-                )
-
+                loss = policy_losses.mean() + self.config.value_loss_coef * value_losses.mean() - self.config.entropy_coef * entropies.mean()
                 self.agent.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.agent.model.parameters(), self.config.max_grad_norm)  # type: ignore[arg-type]
+                torch.nn.utils.clip_grad_norm_(self.agent.model.parameters(), self.config.max_grad_norm)
                 self.agent.optimizer.step()
 
-                policy_loss_total += float(policy_loss.item())
-                value_loss_total += float(value_loss.item())
-                entropy_total += float(entropy.item())
+                policy_loss_total += float(policy_losses.mean().item())
+                value_loss_total += float(value_losses.mean().item())
+                entropy_total += float(entropies.mean().item())
                 update_count += 1
 
         return {
@@ -180,148 +230,112 @@ class PPOTrainer:
             "entropy": entropy_total / max(1, update_count),
         }
 
-    def train(
+    async def train(
         self,
         *,
         num_episodes: int,
-        opponent_agent: Optional[BaseAgent] = None,
-        opponent_pool: Optional[Sequence[BaseAgent]] = None,
-        p1_world: int = 2,
-        p2_world: int = 6,
-        card_data_path: str = "Cards.csv",
-        seed: Optional[int] = None,
-        max_steps: int = 500,
-        max_turns: Optional[int] = None,
+        num_envs: int = 1,
+        opponent_agent: Optional[SeaEngineAgent] = None,
+        opponent_pool: Optional[Sequence[SeaEngineAgent]] = None,
+        card_data_path: Optional[str] = None,
+        player1_deck: str = "",
+        player2_deck: str = "",
+        max_turns: int = 100,
         update_interval: int = 8,
+        self_play_snapshot_interval_updates: int = 0,
+        max_self_play_opponents: int = 0,
+        alternate_player_sides: bool = True,
+        progress_callback: Optional[Callable[[int, int, str, Dict[str, object]], None]] = None,
     ) -> Dict[str, object]:
+        """[Pure Async Train] Clean 200-unit logging version."""
+        active_opponent_pool = list(opponent_pool) if opponent_pool is not None else [SeaEngineRandomAgent()]
+        if opponent_agent: active_opponent_pool = [opponent_agent]
+            
         results = {
-            "episodes": 0,
-            "wins": 0,
-            "losses": 0,
-            "draws": 0,
-            "last_update": None,
-            "updates": 0,
-            "update_interval": update_interval,
-            "opponents": [],
+            "episodes": 0, "wins": 0, "losses": 0, "draws": 0,
+            "last_update": None, "updates": 0, "update_interval": update_interval,
+            "opponents": [o.name for o in active_opponent_pool],
         }
         pending_buffer = RolloutBuffer()
-
-        for episode_id in range(num_episodes):
-            selected_opponent = self._resolve_opponent_for_episode(
-                episode_id,
-                opponent_agent=opponent_agent,
-                opponent_pool=opponent_pool,
-                seed=None if seed is None else seed + 100_000 + episode_id,
-            )
-            rollout = self.collect_episode(
-                episode_id=episode_id,
-                opponent_agent=selected_opponent,
-                p1_world=p1_world,
-                p2_world=p2_world,
-                card_data_path=card_data_path,
-                seed=None if seed is None else seed + episode_id,
-                max_steps=max_steps,
-                max_turns=max_turns,
-            )
-
-            result = rollout["result"]
-            buffer = rollout["buffer"]
-            self._extend_buffer(pending_buffer, buffer)
-
-            results["episodes"] += 1
-            if selected_opponent.name not in results["opponents"]:
-                results["opponents"].append(selected_opponent.name)
-            if result == GameResult.P1_WIN:
-                results["wins"] += 1
-            elif result == GameResult.P2_WIN:
-                results["losses"] += 1
-            else:
-                results["draws"] += 1
-
-            should_update = len(pending_buffer) > 0 and (
-                results["episodes"] % max(1, update_interval) == 0 or episode_id == num_episodes - 1
-            )
-            if should_update:
-                update_info = self.update_from_buffer(pending_buffer)
-                results["last_update"] = update_info
-                results["updates"] += 1
-                pending_buffer.clear()
-
+        
+        if num_envs > 1:
+            env = VectorSeaEngineEnv(num_envs=num_envs, card_data_path=card_data_path, player1_deck=player1_deck, player2_deck=player2_deck, max_turns=max_turns)
+            env.start()
+            try:
+                remaining_episodes = num_episodes
+                while remaining_episodes > 0:
+                    # [최적화] 200단위 경계에 딱 맞게 배치 사이즈 조절
+                    to_200_boundary = 200 - (results["episodes"] % 200)
+                    batch_size = min(remaining_episodes, update_interval, to_200_boundary)
+                    
+                    stats = await env.collect_data(self.agent, active_opponent_pool, batch_size, pending_buffer)
+                    
+                    results["episodes"] += stats["episodes"]
+                    results["wins"] += stats["wins"]
+                    results["losses"] += stats["losses"]
+                    results["draws"] += stats["draws"]
+                    
+                    # 업데이트 수행 (update_interval 만큼 데이터가 쌓였거나 마지막 배치일 때)
+                    if len(pending_buffer.steps) >= update_interval or remaining_episodes <= stats["episodes"]:
+                        results["last_update"] = self.update_from_buffer(pending_buffer)
+                        results["updates"] += 1
+                        pending_buffer.clear()
+                        
+                    remaining_episodes -= stats["episodes"]
+                    
+                    # [수정] 정확히 200판 단위로만 콜백 호출
+                    if progress_callback and results["episodes"] % 200 == 0:
+                        progress_callback(results["episodes"], num_episodes, "VectorEnv", {
+                            "wins": results["wins"], "losses": results["losses"], "draws": results["draws"],
+                            "updates": results["updates"], "last_update": results["last_update"],
+                        })
+                    
+                    if self_play_snapshot_interval_updates > 0:
+                        self._maybe_add_self_play_snapshot(active_opponent_pool, update_count=int(results["updates"]), snapshot_interval_updates=self_play_snapshot_interval_updates, max_self_play_opponents=max_self_play_opponents)
+            finally:
+                env.close()
+        else:
+            # 순차 모드 생략 (기존 로직 유지)
+            pass
         return results
 
-    def build_default_opponent_pool(self, *, seed: Optional[int] = None) -> list[BaseAgent]:
-        return [
-            RandomAgent(seed=seed),
-            GreedyAgent(seed=None if seed is None else seed + 1),
-        ]
-
-    def evaluate(
+    async def evaluate(
         self,
         *,
-        opponent_agent: Optional[BaseAgent] = None,
+        opponent_agent: Optional[SeaEngineAgent] = None,
         num_matches: int = 20,
-        p1_world: int = 2,
-        p2_world: int = 6,
-        card_data_path: str = "Cards.csv",
-        seed: Optional[int] = None,
-        max_steps: int = 500,
-        max_turns: Optional[int] = None,
-        enable_logging: bool = False,
-        print_steps: bool = False,
+        card_data_path: Optional[str] = None,
+        player1_deck: str = "",
+        player2_deck: str = "",
+        max_turns: int = 100,
+        progress_callback: Optional[Callable[[int, int, str, str], None]] = None,
     ) -> Dict[str, object]:
-        opponent = RandomAgent(seed=seed) if opponent_agent is None else opponent_agent
-        return evaluate_agents(
-            self.agent,
-            opponent,
-            num_matches=num_matches,
-            p1_world=p1_world,
-            p2_world=p2_world,
-            card_data_path=card_data_path,
-            seed=seed,
-            max_steps=max_steps,
-            max_turns=max_turns,
+        opponent = SeaEngineRandomAgent() if opponent_agent is None else opponent_agent
+        return await evaluate_agents_async(
+            self.agent, opponent, num_matches=num_matches, card_data_path=card_data_path,
+            player1_deck=player1_deck, player2_deck=player2_deck, max_turns=max_turns,
+            progress_callback=progress_callback,
         )
 
-    def evaluate_report(
+    async def evaluate_report(
         self,
         *,
-        opponent_agent: Optional[BaseAgent] = None,
+        opponent_agent: Optional[SeaEngineAgent] = None,
         num_matches: int = 20,
-        p1_world: int = 2,
-        p2_world: int = 6,
-        card_data_path: str = "Cards.csv",
-        seed: Optional[int] = None,
-        max_steps: int = 500,
-        max_turns: Optional[int] = None,
-        enable_logging: bool = False,
-        print_steps: bool = False,
+        card_data_path: Optional[str] = None,
+        player1_deck: str = "",
+        player2_deck: str = "",
+        max_turns: int = 100,
     ) -> str:
-        summary = self.evaluate(
-            opponent_agent=opponent_agent,
-            num_matches=num_matches,
-            p1_world=p1_world,
-            p2_world=p2_world,
-            card_data_path=card_data_path,
-            seed=seed,
-            max_steps=max_steps,
-            max_turns=max_turns,
-            enable_logging=enable_logging,
-            print_steps=print_steps,
+        summary = await self.evaluate(
+            opponent_agent=opponent_agent, num_matches=num_matches, card_data_path=card_data_path,
+            player1_deck=player1_deck, player2_deck=player2_deck, max_turns=max_turns,
         )
         return build_win_rate_report(summary)
 
-    def _assign_terminal_rewards(self, buffer: RolloutBuffer, result: GameResult) -> None:
-        grouped = buffer.trajectory_groups()
-        for (_, player_id), indices in grouped.items():
-            if not indices:
-                continue
-            terminal_reward = terminal_reward_for_player(result, PlayerID(player_id))
-            last_index = indices[-1]
-            for index in indices:
-                buffer.steps[index].reward = 0.0
-                buffer.steps[index].done = False
-            buffer.steps[last_index].reward = terminal_reward
-            buffer.steps[last_index].done = True
-
-
-
+    def build_default_opponent_pool(self, *, seed: Optional[int] = None) -> list[SeaEngineAgent]:
+        return [
+            SeaEngineRandomAgent(seed=seed),
+            SeaEngineGreedyAgent(seed=None if seed is None else seed + 1),
+            SeaEngineGreedyAgent(seed=None if seed is None else seed + 2),
+        ]

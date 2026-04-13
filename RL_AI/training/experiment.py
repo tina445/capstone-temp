@@ -1,276 +1,196 @@
+"""Checkpoint training experiment for SeaEngine (Asynchronous version).
+Fixed to save models in RL_AI/models/ and only save the RL agent.
+"""
+
 from __future__ import annotations
 
-# 학습 전 평가 -> 학습 -> 학습 후 평가를 한 번에 실행하는 실험 파일
-# 빠르게 RL 사이클을 돌려보고, 전후 비교 결과를 텍스트 리포트로 저장하는 데 사용한다.
-
-from datetime import datetime
-from pathlib import Path
+import os
 import time
-from typing import Dict, Optional
+import datetime
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Any
 
-from RL_AI.agents.base_agent import BaseAgent
-from RL_AI.agents.greedy_agent import GreedyAgent
-from RL_AI.agents.random_agent import RandomAgent
-from RL_AI.agents.rl_agent import RLAgent
+import torch
+
+from RL_AI.agents.agents import SeaEngineAgent, SeaEngineGreedyAgent, SeaEngineRLAgent, SeaEngineRandomAgent
+from RL_AI.training.trainer import SeaEnginePPOTrainer
 from RL_AI.analysis.reports import build_win_rate_report, save_report
-from RL_AI.training.trainer import PPOTrainer
 
 
-def _default_report_path(prefix: str = "train_eval_report") -> Path:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(__file__).resolve().parent.parent / "log" / f"{prefix}_{ts}.txt"
+def _auto_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _seed_with_offset(seed: Optional[int], offset: int) -> Optional[int]:
-    return None if seed is None else seed + offset
+def zip_and_cleanup_logs(log_dir: Path, prefix: str):
+    """새로 생성된 로그들을 압축하고 원본을 삭제합니다."""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = log_dir / f"logs_{prefix}_{timestamp}.zip"
+    
+    # 압축 대상 파일 목록 (최근 1시간 내 생성된 txt, jsonl)
+    now = time.time()
+    log_files = []
+    for ext in ["*.txt", "*.jsonl"]:
+        for p in log_dir.glob(ext):
+            if now - p.stat().st_mtime < 3600: # 1시간 이내
+                log_files.append(p)
+    
+    if not log_files:
+        return
+        
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for f in log_files:
+            zipf.write(f, f.name)
+            
+    for f in log_files:
+        try:
+            os.remove(f)
+        except:
+            pass
+    print(f"\n[Logs Archived] => {zip_path}")
 
 
-def run_train_eval_experiment(
-    *,
-    agent: Optional[RLAgent] = None,
-    opponent_agent: Optional[BaseAgent] = None,
-    eval_matches_before: int = 20,
-    train_episodes: int = 50,
-    eval_matches_after: int = 20,
-    p1_world: int = 2,
-    p2_world: int = 6,
-    card_data_path: str = "Cards.csv",
-    seed: Optional[int] = None,
-    max_steps: int = 200,
-    max_turns: Optional[int] = None,
-    report_path: Optional[str] = None,
-) -> Dict[str, object]:
-    learning_agent = RLAgent(seed=seed) if agent is None else agent
-    opponent = RandomAgent(seed=seed) if opponent_agent is None else opponent_agent
-    trainer = PPOTrainer(learning_agent)
-
-    before_summary = trainer.evaluate(
-        opponent_agent=opponent,
-        num_matches=eval_matches_before,
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=seed,
-        max_steps=max_steps,
-        max_turns=max_turns,
-        enable_logging=False,
-        print_steps=False,
-    )
-
-    train_summary = trainer.train(
-        num_episodes=train_episodes,
-        opponent_agent=opponent,
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=None if seed is None else seed + 10_000,
-        max_steps=max_steps,
-        max_turns=max_turns,
-    )
-
-    after_summary = trainer.evaluate(
-        opponent_agent=opponent,
-        num_matches=eval_matches_after,
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=None if seed is None else seed + 20_000,
-        max_steps=max_steps,
-        max_turns=max_turns,
-        enable_logging=False,
-        print_steps=False,
-    )
-
-    report_lines = [
-        "=== Before Training ===",
-        build_win_rate_report(before_summary),
-        "",
-        "=== Training Summary ===",
-        str(train_summary),
-        "",
-        "=== After Training ===",
-        build_win_rate_report(after_summary),
-    ]
-    report_text = "\n".join(report_lines)
-    saved_path = save_report(report_text, _default_report_path() if report_path is None else report_path)
-
-    return {
-        "before": before_summary,
-        "train": train_summary,
-        "after": after_summary,
-        "report_text": report_text,
-        "report_path": str(saved_path),
-    }
-
-
-def run_checkpoint_training_experiment(
-    *,
-    agent: Optional[RLAgent] = None,
-    train_opponent_agent: Optional[BaseAgent] = None,
-    eval_opponent_agent: Optional[BaseAgent] = None,
-    final_eval_opponent_agent: Optional[BaseAgent] = None,
+async def run_checkpoint_training_experiment(
+    agent: SeaEngineRLAgent,
+    train_opponent_pool: Optional[Sequence[SeaEngineAgent]] = None,
+    eval_greedy_agent: Optional[SeaEngineAgent] = None,
+    eval_random_agent: Optional[SeaEngineAgent] = None,
     eval_matches: int = 100,
-    total_train_episodes: int = 300,
-    eval_interval: int = 100,
-    final_random_eval_matches: int = 100,
-    p1_world: int = 2,
-    p2_world: int = 6,
-    card_data_path: str = "Cards.csv",
+    total_train_episodes: int = 3000,
+    eval_interval: int = 600,
+    max_turns: int = 100,
+    update_interval: int = 16,
+    self_play_snapshot_interval_updates: int = 5,
+    max_self_play_opponents: int = 2,
+    alternate_player_sides: bool = True,
+    card_data_path: Optional[str] = None,
+    player1_deck: str = "",
+    player2_deck: str = "",
     seed: Optional[int] = None,
-    max_steps: int = 200,
-    max_turns: Optional[int] = None,
     summary_report_path: Optional[str] = None,
-) -> Dict[str, object]:
-    learning_agent = RLAgent(seed=seed) if agent is None else agent
-    trainer = PPOTrainer(learning_agent)
+) -> Dict[str, Any]:
+    """[Pure Async Experiment] Runs the training loop using await."""
+    start_time = time.time()
+    log_dir = Path("RL_AI/log")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    device = _auto_device()
+    print(f"Using device: {device}  |  CUDA available: {torch.cuda.is_available()}")
+    agent.device = torch.device(device)
 
-    train_opponent = RandomAgent(seed=_seed_with_offset(seed, 1_000)) if train_opponent_agent is None else train_opponent_agent
-    eval_opponent = GreedyAgent(seed=_seed_with_offset(seed, 2_000)) if eval_opponent_agent is None else eval_opponent_agent
-    final_eval_opponent = (
-        RandomAgent(seed=_seed_with_offset(seed, 3_000))
-        if final_eval_opponent_agent is None
-        else final_eval_opponent_agent
-    )
+    trainer = SeaEnginePPOTrainer(agent)
+    greedy_eval_opponent = eval_greedy_agent or SeaEngineGreedyAgent()
+    random_eval_opponent = eval_random_agent or SeaEngineRandomAgent()
 
+    checkpoints: List[Dict[str, object]] = []
+    best_random_checkpoint: Optional[Dict[str, object]] = None
+    
     summary_lines = [
-        "=== Checkpoint Training Experiment ===",
+        "=== SeaEngine Checkpoint Training Experiment ===",
         f"total_train_episodes={total_train_episodes}",
         f"eval_interval={eval_interval}",
-        f"eval_matches={eval_matches}",
-        f"final_random_eval_matches={final_random_eval_matches}",
-        f"train_opponent={train_opponent.name}",
-        f"eval_opponent={eval_opponent.name}",
-        f"final_eval_opponent={final_eval_opponent.name}",
-        f"max_steps={max_steps}",
-        f"max_turns={max_turns}",
         "",
     ]
 
-    checkpoint_results = []
-    overall_start = time.time()
-
-    before_start = time.time()
-    before_summary = trainer.evaluate(
-        opponent_agent=eval_opponent,
+    # --- Initial Evaluation ---
+    before_greedy = await trainer.evaluate(
+        opponent_agent=greedy_eval_opponent,
         num_matches=eval_matches,
-        p1_world=p1_world,
-        p2_world=p2_world,
         card_data_path=card_data_path,
-        seed=_seed_with_offset(seed, 10_000),
-        max_steps=max_steps,
+        player1_deck=player1_deck,
+        player2_deck=player2_deck,
         max_turns=max_turns,
-        enable_logging=False,
-        print_steps=False,
     )
-    before_elapsed = time.time() - before_start
-    summary_lines.extend(
-        [
-            "=== Before Training vs Greedy ===",
-            f"time={before_elapsed:.2f}s",
-            f"report={before_summary['report_path']}",
-            build_win_rate_report(before_summary),
-            "",
-        ]
-    )
+    summary_lines.extend([
+        "=== Before Training vs Greedy ===",
+        f"report={before_greedy['report_path']}",
+        build_win_rate_report(before_greedy),
+        "",
+    ])
 
     episodes_completed = 0
-    checkpoint_index = 0
     while episodes_completed < total_train_episodes:
-        chunk_size = min(eval_interval, total_train_episodes - episodes_completed)
-        train_start = time.time()
-        train_summary = trainer.train(
-            num_episodes=chunk_size,
-            opponent_agent=train_opponent,
-            p1_world=p1_world,
-            p2_world=p2_world,
+        current_batch = min(eval_interval, total_train_episodes - episodes_completed)
+        print(f"\n--- Training Episodes {episodes_completed + 1} to {episodes_completed + current_batch} ---")
+        
+        train_stats = await trainer.train(
+            num_episodes=current_batch,
+            num_envs=8,
+            opponent_pool=train_opponent_pool,
             card_data_path=card_data_path,
-            seed=_seed_with_offset(seed, 20_000 + episodes_completed),
-            max_steps=max_steps,
+            player1_deck=player1_deck,
+            player2_deck=player2_deck,
             max_turns=max_turns,
+            update_interval=update_interval,
+            self_play_snapshot_interval_updates=self_play_snapshot_interval_updates,
+            max_self_play_opponents=max_self_play_opponents,
+            alternate_player_sides=alternate_player_sides,
+            progress_callback=lambda ep, tot, opp, st: print(
+                f"[train ep={episodes_completed + ep}/{total_train_episodes}] opponent={opp} | "
+                f"w/l/d={st.get('wins')}/{st.get('losses')}/{st.get('draws')} | updates={st.get('updates')}"
+            ) if (episodes_completed + ep) % 200 == 0 else None
         )
-        train_elapsed = time.time() - train_start
-        episodes_completed += chunk_size
-
-        eval_start = time.time()
-        checkpoint_summary = trainer.evaluate(
-            opponent_agent=eval_opponent,
+        
+        episodes_completed += current_batch
+        
+        eval_greedy = await trainer.evaluate(
+            opponent_agent=greedy_eval_opponent,
             num_matches=eval_matches,
-            p1_world=p1_world,
-            p2_world=p2_world,
             card_data_path=card_data_path,
-            seed=_seed_with_offset(seed, 30_000 + checkpoint_index * 1_000),
-            max_steps=max_steps,
+            player1_deck=player1_deck,
+            player2_deck=player2_deck,
             max_turns=max_turns,
-            enable_logging=False,
-            print_steps=False,
         )
-        eval_elapsed = time.time() - eval_start
+        eval_random = await trainer.evaluate(
+            opponent_agent=random_eval_opponent,
+            num_matches=eval_matches,
+            card_data_path=card_data_path,
+            player1_deck=player1_deck,
+            player2_deck=player2_deck,
+            max_turns=max_turns,
+        )
 
-        checkpoint_record = {
-            "episodes_completed": episodes_completed,
-            "train_summary": train_summary,
-            "train_time_sec": train_elapsed,
-            "eval_summary": checkpoint_summary,
-            "eval_time_sec": eval_elapsed,
+        checkpoint_data = {
+            "episodes": episodes_completed,
+            "greedy_stats": eval_greedy,
+            "random_stats": eval_random,
+            "train_summary": train_stats,
         }
-        checkpoint_results.append(checkpoint_record)
+        checkpoints.append(checkpoint_data)
 
-        summary_lines.extend(
-            [
-                f"=== Checkpoint {episodes_completed} Episodes vs Greedy ===",
-                f"train_time={train_elapsed:.2f}s",
-                f"eval_time={eval_elapsed:.2f}s",
-                f"report={checkpoint_summary['report_path']}",
-                f"train_summary={train_summary}",
-                build_win_rate_report(checkpoint_summary),
-                "",
-            ]
-        )
-        checkpoint_index += 1
-
-    final_random_start = time.time()
-    final_random_summary = trainer.evaluate(
-        opponent_agent=final_eval_opponent,
-        num_matches=final_random_eval_matches,
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=_seed_with_offset(seed, 40_000),
-        max_steps=max_steps,
-        max_turns=max_turns,
-        enable_logging=False,
-        print_steps=False,
-    )
-    final_random_elapsed = time.time() - final_random_start
-    total_elapsed = time.time() - overall_start
-
-    summary_lines.extend(
-        [
-            f"=== Final Evaluation vs {final_eval_opponent.name} ===",
-            f"time={final_random_elapsed:.2f}s",
-            f"report={final_random_summary['report_path']}",
-            build_win_rate_report(final_random_summary),
+        summary_lines.extend([
+            f"=== Checkpoint {episodes_completed} Episodes ===",
+            f"greedy_report={eval_greedy['report_path']}",
+            f"random_report={eval_random['report_path']}",
             "",
-            f"TOTAL_TIME={total_elapsed:.2f}s",
-        ]
-    )
+        ])
 
-    summary_text = "\n".join(summary_lines)
-    summary_path = save_report(
-        summary_text,
-        _default_report_path("checkpoint_training_report") if summary_report_path is None else summary_report_path,
-    )
+        models_dir = Path("RL_AI/models")
+        models_dir.mkdir(parents=True, exist_ok=True)
+        
+        if best_random_checkpoint is None or eval_random["p1_wins"] > best_random_checkpoint["random_stats"]["p1_wins"]:
+            best_random_checkpoint = checkpoint_data
+            agent.save(models_dir / "my_best_model.pt")
+
+    # --- Final Summary ---
+    summary_lines.extend([
+        "=== Best Checkpoint Summary ===",
+        f"episodes_completed={best_random_checkpoint['episodes'] if best_random_checkpoint else 0}",
+    ])
+
+    final_report = "\n".join(summary_lines)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = summary_report_path or f"RL_AI/log/training_report_{ts}.txt"
+    save_report(final_report, report_file)
+
+    total_time_sec = time.time() - start_time
+    
+    # 실험 종료 후 로그 압축 및 정리
+    zip_and_cleanup_logs(log_dir, "train")
 
     return {
-        "before": before_summary,
-        "before_time_sec": before_elapsed,
-        "checkpoints": checkpoint_results,
-        "final_random": final_random_summary,
-        "final_random_time_sec": final_random_elapsed,
-        "total_time_sec": total_elapsed,
-        "summary_text": summary_text,
-        "summary_report_path": str(summary_path),
+        "checkpoints": checkpoints, 
+        "best_random": best_random_checkpoint,
+        "total_time_sec": total_time_sec,
+        "summary_report_path": str(report_file)
     }
-
-
-

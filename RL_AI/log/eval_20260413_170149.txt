@@ -1,0 +1,7 @@
+=== Evaluation Report ===
+Episodes: 100
+P1 (rl) wins: 41 (41.0%)
+P2 (greedy) wins: 59 (59.0%)
+Draws: 0 (0.0%)
+Average steps: 14.97
+Average final turn: 0.00

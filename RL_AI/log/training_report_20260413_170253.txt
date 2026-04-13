@@ -1,0 +1,84 @@
+=== SeaEngine Checkpoint Training Experiment ===
+total_train_episodes=10000
+eval_interval=600
+
+=== Before Training vs Greedy ===
+report=RL_AI/log/eval_20260413_163435.txt
+=== Evaluation Report ===
+Episodes: 100
+P1 (rl) wins: 42 (42.0%)
+P2 (greedy) wins: 58 (58.0%)
+Draws: 0 (0.0%)
+Average steps: 21.18
+Average final turn: 0.00
+
+=== Checkpoint 600 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_163551.txt
+random_report=RL_AI/log/eval_20260413_163604.txt
+
+=== Checkpoint 1200 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_163736.txt
+random_report=RL_AI/log/eval_20260413_163743.txt
+
+=== Checkpoint 1800 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_163929.txt
+random_report=RL_AI/log/eval_20260413_163936.txt
+
+=== Checkpoint 2400 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_164118.txt
+random_report=RL_AI/log/eval_20260413_164125.txt
+
+=== Checkpoint 3000 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_164301.txt
+random_report=RL_AI/log/eval_20260413_164308.txt
+
+=== Checkpoint 3600 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_164418.txt
+random_report=RL_AI/log/eval_20260413_164425.txt
+
+=== Checkpoint 4200 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_164714.txt
+random_report=RL_AI/log/eval_20260413_164721.txt
+
+=== Checkpoint 4800 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_164926.txt
+random_report=RL_AI/log/eval_20260413_164934.txt
+
+=== Checkpoint 5400 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_165039.txt
+random_report=RL_AI/log/eval_20260413_165047.txt
+
+=== Checkpoint 6000 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_165214.txt
+random_report=RL_AI/log/eval_20260413_165221.txt
+
+=== Checkpoint 6600 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_165340.txt
+random_report=RL_AI/log/eval_20260413_165347.txt
+
+=== Checkpoint 7200 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_165502.txt
+random_report=RL_AI/log/eval_20260413_165509.txt
+
+=== Checkpoint 7800 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_165618.txt
+random_report=RL_AI/log/eval_20260413_165625.txt
+
+=== Checkpoint 8400 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_165747.txt
+random_report=RL_AI/log/eval_20260413_165754.txt
+
+=== Checkpoint 9000 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_170016.txt
+random_report=RL_AI/log/eval_20260413_170023.txt
+
+=== Checkpoint 9600 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_170149.txt
+random_report=RL_AI/log/eval_20260413_170157.txt
+
+=== Checkpoint 10000 Episodes ===
+greedy_report=RL_AI/log/eval_20260413_170245.txt
+random_report=RL_AI/log/eval_20260413_170253.txt
+
+=== Best Checkpoint Summary ===
+episodes_completed=6600

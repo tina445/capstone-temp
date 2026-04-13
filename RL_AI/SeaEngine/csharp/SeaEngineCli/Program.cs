@@ -1,8 +1,9 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using SeaEngine;
-using SeaEngine.Actions;
+using SeaEngine.Common;
 using SeaEngine.CardManager;
+using SeaEngine.GameDataManager;
 using SeaEngine.GameDataManager.Components;
 using SeaEngine.Logger;
 
@@ -68,6 +69,39 @@ while (true)
                 WriteResponse(new BridgeResponse("ok", BuildSnapshot(game, turnCounter), null));
                 break;
 
+            case "apply_auto":
+                EnsureGame(game);
+                if (string.IsNullOrWhiteSpace(request.ActionUid))
+                    throw new InvalidOperationException("action_uid is required for apply_auto");
+                if (string.IsNullOrWhiteSpace(request.LearnerId))
+                    throw new InvalidOperationException("learner_id is required for apply_auto");
+
+                // 1) RL 에이전트의 선택 액션 적용
+                var rlAction = game!.Actions.FirstOrDefault(a => a.Guid.ToString() == request.ActionUid)
+                    ?? throw new InvalidOperationException($"Unknown action uid: {request.ActionUid}");
+                game.UseAction(rlAction.Guid);
+                if (rlAction.EffectId == "TurnEnd") turnCounter++;
+
+                // 2) 상대 턴을 자동 진행 (random 또는 greedy 전략)
+                var autoRng = new Random();
+                var autoStrategy = (request.Strategy ?? "random").ToLowerInvariant();
+                int safetyLimit = 0;
+                while (game.Data.Winner == null
+                       && game.Data.ActivePlayerId != request.LearnerId
+                       && safetyLimit < 2000)
+                {
+                    safetyLimit++;
+                    var available = game.Actions.ToList();
+                    if (available.Count == 0) break;
+                    var chosen = autoStrategy == "greedy"
+                        ? ChooseGreedyAction(available, game.Data.Board.Cards.ToList(), autoRng)
+                        : available[autoRng.Next(available.Count)];
+                    game.UseAction(chosen.Guid);
+                    if (chosen.EffectId == "TurnEnd") turnCounter++;
+                }
+                WriteResponse(new BridgeResponse("ok", BuildSnapshot(game, turnCounter), null));
+                break;
+
             case "close":
                 WriteResponse(new BridgeResponse("ok", new { closed = true }, null));
                 return;
@@ -79,7 +113,7 @@ while (true)
     }
     catch (Exception ex)
     {
-        WriteResponse(new BridgeResponse("error", null, ex.Message));
+        WriteResponse(new BridgeResponse("error", null, ex.ToString()));
     }
 }
 
@@ -94,9 +128,11 @@ void WriteResponse(BridgeResponse response)
 Game CreateGame(BridgeRequest request)
 {
     var cardsPath = string.IsNullOrWhiteSpace(request.CardDataPath)
-        ? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "cards", "Cards.csv"))
+        ? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "Cards.csv"))
         : Path.GetFullPath(request.CardDataPath);
-    var loader = new CardLoader(cardsPath);
+    
+    var loader = new CardLoader(File.ReadAllLines(cardsPath));
+    
     var created = new Game(loader, new SilentLogger(), request.Player1Id ?? "P1", request.Player2Id ?? "P2");
     created.Init(
         NormalizeDeckJson(request.Player1Deck, true),
@@ -124,6 +160,35 @@ static void EnsureGame(Game? existing)
     {
         throw new InvalidOperationException("game_not_initialized");
     }
+}
+
+static GameAction ChooseGreedyAction(List<GameAction> actions, List<Card> boardCards, Random rng)
+{
+    // Uid.ToString() 기반으로 card 조회 (C# Uid는 System.Guid가 아님)
+    var cardByGuidStr = boardCards
+        .Where(c => c.Unit.IsPlaced)
+        .ToDictionary(c => c.Guid.ToString());
+
+    int Score(GameAction a)
+    {
+        var score = a.EffectId switch
+        {
+            "DefaultAttack" => 80,
+            "DeployUnit"    => 45,
+            "DefaultMove"   => 20,
+            "TurnEnd"       => -100,
+            _               => 55,   // 스킬
+        };
+        // 유닛 타깃이면 Leader 보너스 + 저체력 보너스 추가
+        if (cardByGuidStr.TryGetValue(a.Target.Guid.ToString(), out var tCard))
+        {
+            if (tCard.Data.UnitType.ToString() == "Leader") score += 100;
+            score += Math.Max(0, 10 - tCard.Unit.Hp);
+        }
+        return score + rng.Next(4);  // 타이 브레이킹
+    }
+
+    return actions.MaxBy(Score)!;
 }
 
 static object BuildSnapshot(Game game, int turnCounter)
@@ -241,7 +306,9 @@ file sealed record BridgeRequest(
     string? Player2Deck = null,
     string? Player1Id = null,
     string? Player2Id = null,
-    string? ActionUid = null
+    string? ActionUid = null,
+    string? LearnerId = null,
+    string? Strategy = null
 );
 
 file sealed record BridgeResponse(string Status, object? Payload = null, string? Error = null);

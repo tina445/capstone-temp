@@ -22,7 +22,7 @@ class SeaEngineSession:
         self.card_data_path = str(
             Path(card_data_path).resolve()
             if card_data_path is not None
-            else (self.project_root.parent / "cards" / "Cards.csv").resolve()
+            else (self.project_root / "Cards.csv").resolve()
         )
         self._proc: Optional[subprocess.Popen[str]] = None
 
@@ -78,7 +78,10 @@ class SeaEngineSession:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-                self._proc.wait(timeout=5)
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
             self._proc = None
 
     def ping(self) -> Dict[str, Any]:
@@ -108,6 +111,24 @@ class SeaEngineSession:
 
     def apply_action(self, action_uid: str) -> Dict[str, Any]:
         return self._request({"command": "apply", "action_uid": action_uid})
+
+    def apply_and_auto_play(
+        self,
+        action_uid: str,
+        learner_id: str,
+        strategy: str = "random",
+    ) -> Dict[str, Any]:
+        """RL 행동을 적용한 뒤, 상대 턴을 C# 내부에서 자동으로 처리한다.
+        learner_id 플레이어의 차례가 될 때까지 (또는 게임 종료 시까지) C# 측에서
+        strategy(random|greedy)로 상대를 움직인다.
+        IPC 호출 수를 약 50% 줄이는 핵심 최적화.
+        """
+        return self._request({
+            "command": "apply_auto",
+            "action_uid": action_uid,
+            "learner_id": learner_id,
+            "strategy": strategy,
+        })
 
     def _request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:

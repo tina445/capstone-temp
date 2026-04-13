@@ -1,669 +1,213 @@
-#케임에 대한 간단한 CLI 매치 루프 프로토타입
-#상태, 규칙, 엔진, debug)view를 연결해서 사람이 보드를 확인하고 행동을 선택
-#self-play, 로깅, RL 학습 이전에 수동으로 실행함
-
-from __future__ import annotations
-
+import argparse
+import sys
+import json
 import random
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from contextlib import nullcontext
+from typing import Any, Dict
 
-from RL_AI.SeaEngine.action_adapter import choose_action_with_agent as choose_cs_action_with_agent
+# RL_AI module path resolution
+parent_dir = str(Path(__file__).resolve().parent.parent)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+import torch
+
 from RL_AI.SeaEngine.bridge.seaengine_session import SeaEngineSession
+from RL_AI.SeaEngine.action_adapter import choose_action_with_agent
+from RL_AI.agents.agents import (
+    SeaEngineAgent,
+    SeaEngineRandomAgent,
+    SeaEngineGreedyAgent,
+    SeaEngineRLAgent,
+)
 
-try:
-    from RL_AI.agents.base_agent import BaseAgent
-    from RL_AI.game_engine.engine import apply_action, initialize_main_phase
-    from RL_AI.game_engine.rules import get_legal_actions
-    from RL_AI.game_engine.state import Action, GameState, PlayerID, create_initial_game_state, load_supported_card_db
-    _LEGACY_ENGINE_AVAILABLE = True
-except ModuleNotFoundError:
-    BaseAgent = object  # type: ignore[assignment]
-    Action = object  # type: ignore[assignment]
-    GameState = object  # type: ignore[assignment]
-    PlayerID = object  # type: ignore[assignment]
-    apply_action = initialize_main_phase = get_legal_actions = None  # type: ignore[assignment]
-    create_initial_game_state = load_supported_card_db = None  # type: ignore[assignment]
-    _LEGACY_ENGINE_AVAILABLE = False
+class HumanTerminalAgent(SeaEngineAgent):
+    def __init__(self, name: str = "human"):
+        super().__init__(name)
 
+    def select_action(self, snapshot: Dict[str, Any], legal_actions: list[Dict[str, Any]]) -> tuple[int, Dict[str, Any]]:
+        print(f"\n--- Turn {snapshot['turn']}, Phase {snapshot['phase']}, {snapshot['active_player']} ---")
+        print("Board:")
+        for card in snapshot.get("board", []):
+            if card.get("is_placed"):
+               print(f"  [{card['owner']}] {card.get('name', card.get('card_id'))} HP:{card.get('hp')}/{card.get('max_hp')} @ ({card.get('pos_x')},{card.get('pos_y')})")
+        print("\nLegal Actions:")
+        for i, a in enumerate(legal_actions):
+            text = a.get("text", str(a))
+            print(f"  {i}: {text}")
 
-def _default_log_base(prefix: str) -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = Path(__file__).resolve().parent.parent / "log"
-    return str(log_dir / f"{prefix}_{ts}")
-
-
-def _require_legacy_engine() -> None:
-    if not _LEGACY_ENGINE_AVAILABLE:
-        raise RuntimeError(
-            "Legacy Python engine is not available in this layout. Use the SeaEngine functions "
-            "such as run_cs_random_match / run_cs_agent_match / run_cs_manual_match instead."
-        )
-
-
-class MatchRunner:
-    def __init__(self, state: GameState, card_db, seed: Optional[int] = None):
-        _require_legacy_engine()
-        self.state = state
-        self.card_db = card_db
-        self.rng = random.Random(seed)
-
-    def initialize(self) -> None:
-        self.state = initialize_main_phase(self.state, self.card_db, self.rng)
-
-    def get_legal_actions(self) -> List[Action]:
-        return get_legal_actions(self.state, card_db=self.card_db)
-
-    def step(self, action: Action) -> GameState:
-        self.state = apply_action(self.state, action, self.card_db, self.rng)
-        return self.state
-
-    def is_done(self) -> bool:
-        return self.state.is_terminal()
-
-    def current_player(self) -> PlayerID:
-        return self.state.active_player
-
-
-def choose_action_by_index(state: GameState, legal_actions: Sequence[Action]) -> tuple[int, Action]:
-    while True:
-        raw = input("Select action index (or 'q' to quit): ").strip()
-        if raw.lower() in {"q", "quit", "exit"}:
-            raise KeyboardInterrupt
-        if not raw.isdigit():
-            print("Please enter a valid action index.")
-            continue
-
-        idx = int(raw)
-        if 0 <= idx < len(legal_actions):
-            return idx, legal_actions[idx]
-        print(f"Index out of range. Enter 0 ~ {len(legal_actions) - 1}.")
-
-
-def choose_action_randomly(legal_actions: Sequence[Action], rng: random.Random) -> tuple[int, Action]:
-    idx = rng.randrange(len(legal_actions))
-    return idx, legal_actions[idx]
-
-
-def choose_action_with_agent(
-    agent: BaseAgent,
-    state: GameState,
-    legal_actions: Sequence[Action],
-    *,
-    card_db,
-) -> tuple[int, Action]:
-    _require_legacy_engine()
-    return agent.select_action(state, legal_actions, card_db=card_db)
-
-
-def _build_match_metadata(
-    *,
-    p1_world: int,
-    p2_world: int,
-    seed: Optional[int],
-    first_player: Optional[PlayerID],
-    mode: str,
-    max_steps: Optional[int] = None,
-    max_turns: Optional[int] = None,
-) -> dict:
-    meta = {
-        "mode": mode,
-        "p1_world": p1_world,
-        "p2_world": p2_world,
-        "seed": seed,
-        "first_player": None if first_player is None else ("P1" if first_player == PlayerID.P1 else "P2"),
-    }
-    if max_steps is not None:
-        meta["max_steps"] = max_steps
-    if max_turns is not None:
-        meta["max_turns"] = max_turns
-    return meta
-
-
-def _turn_limit_reached(state: GameState, max_turns: Optional[int]) -> bool:
-    return max_turns is not None and state.turn > max_turns
-
-
-def print_cs_snapshot(snapshot: Dict[str, Any]) -> None:
-    print(
-        f"Turn={snapshot['turn']} Active={snapshot['active_player']} "
-        f"Result={snapshot['result']} Winner={snapshot.get('winner_id') or '-'}"
-    )
-    print("Board:")
-    for card in snapshot.get("board", []):
-        if not card["is_placed"]:
-            continue
-        pos = f"({card['pos_x']},{card['pos_y']})"
-        print(
-            f"  {card['owner']} {card['name']}[{card['card_id']}] {pos} "
-            f"ATK={card['effective_atk']} HP={card['hp']}/{card['max_hp']}"
-        )
-    print("Actions:")
-    for idx, action in enumerate(snapshot.get("actions", [])):
-        print(f"  [{idx}] {action['uid']} {action['effect_id']} {action['text']}")
-
-
-def _prompt_cs_manual_action(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    actions = snapshot.get("actions", [])
-    while True:
-        raw = input("Select action index (or q): ").strip()
-        if raw.lower() in {"q", "quit", "exit"}:
-            raise KeyboardInterrupt("manual_exit")
-        if not raw.isdigit():
-            print("Please enter a numeric index.")
-            continue
-        idx = int(raw)
-        if idx < 0 or idx >= len(actions):
-            print("Index out of range.")
-            continue
-        return actions[idx]
-
-
-def run_cs_random_match(
-    *,
-    seed: Optional[int] = None,
-    max_turns: int = 100,
-    card_data_path: Optional[str] = None,
-    player1_deck: str = "",
-    player2_deck: str = "",
-    print_steps: bool = True,
-) -> Dict[str, Any]:
-    rng = random.Random(seed)
-    session = SeaEngineSession(card_data_path=card_data_path)
-    session.start()
-    try:
-        snapshot = session.init_game(player1_deck=player1_deck, player2_deck=player2_deck)
-        while snapshot["result"] == "Ongoing" and snapshot["turn"] <= max_turns:
-            actions = snapshot.get("actions", [])
-            if not actions:
-                break
-            chosen = rng.choice(actions)
-            if print_steps:
-                print(f"[turn {snapshot['turn']}] {snapshot['active_player']} -> {chosen['text']}")
-            snapshot = session.apply_action(chosen["uid"])
-
-        if print_steps:
-            print_cs_snapshot(snapshot)
-        return snapshot
-    finally:
-        session.close()
-
-
-def run_cs_manual_match(
-    *,
-    card_data_path: Optional[str] = None,
-    player1_deck: str = "",
-    player2_deck: str = "",
-) -> Dict[str, Any]:
-    session = SeaEngineSession(card_data_path=card_data_path)
-    session.start()
-    try:
-        snapshot = session.init_game(player1_deck=player1_deck, player2_deck=player2_deck)
-        while snapshot["result"] == "Ongoing":
-            print_cs_snapshot(snapshot)
-            actions = snapshot.get("actions", [])
-            if not actions:
-                break
+        while True:
             try:
-                chosen = _prompt_cs_manual_action(snapshot)
-            except KeyboardInterrupt:
-                break
-            snapshot = session.apply_action(chosen["uid"])
+                idx = int(input("Select action idx: "))
+                if 0 <= idx < len(legal_actions):
+                    return idx, legal_actions[idx]
+            except ValueError:
+                pass
+            print("Invalid index.")
 
-        print_cs_snapshot(snapshot)
-        return snapshot
-    finally:
-        session.close()
+def get_agent_by_type(agent_type: str, model_path: str = "") -> SeaEngineAgent:
+    if agent_type == "human":
+        return HumanTerminalAgent()
+    elif agent_type == "random":
+        return SeaEngineRandomAgent()
+    elif agent_type == "greedy":
+        return SeaEngineGreedyAgent()
+    elif agent_type == "rl_untrained":
+        return SeaEngineRLAgent(device="cuda" if torch.cuda.is_available() else "cpu", sample_actions=False)
+    elif agent_type == "rl_trained":
+        if not model_path:
+            raise ValueError("model_path is required for rl_trained agent")
+        agent = SeaEngineRLAgent(device="cuda" if torch.cuda.is_available() else "cpu", sample_actions=False)
+        agent.load(model_path)
+        return agent
+    raise ValueError(f"Unknown agent type: {agent_type}")
 
-
-def run_cs_agent_match(
-    p1_agent,
-    p2_agent,
-    *,
-    seed: Optional[int] = None,
-    max_turns: int = 100,
-    card_data_path: Optional[str] = None,
-    player1_deck: str = "",
-    player2_deck: str = "",
-    print_steps: bool = True,
-) -> Dict[str, Any]:
-    random.Random(seed)
-    session = SeaEngineSession(card_data_path=card_data_path)
-    session.start()
-    try:
-        snapshot = session.init_game(player1_deck=player1_deck, player2_deck=player2_deck)
-        agents = {"P1": p1_agent, "P2": p2_agent}
-        while snapshot["result"] == "Ongoing" and snapshot["turn"] <= max_turns:
-            actions = snapshot.get("actions", [])
-            if not actions:
-                break
-            acting_agent = agents[snapshot["active_player"]]
-            _, chosen = choose_cs_action_with_agent(acting_agent, snapshot)
-            if print_steps:
-                print(f"[turn {snapshot['turn']}] {snapshot['active_player']}:{acting_agent.name} -> {chosen['text']}")
-            snapshot = session.apply_action(chosen["uid"])
-
-        if print_steps:
-            print_cs_snapshot(snapshot)
-        return snapshot
-    finally:
-        session.close()
-
-
-def run_cs_mixed_match(
-    p1_controller=None,
-    p2_controller=None,
-    *,
-    seed: Optional[int] = None,
-    max_turns: int = 100,
-    card_data_path: Optional[str] = None,
-    player1_deck: str = "",
-    player2_deck: str = "",
-    print_steps: bool = True,
-) -> Dict[str, Any]:
-    random.Random(seed)
-    session = SeaEngineSession(card_data_path=card_data_path)
-    session.start()
-    try:
-        snapshot = session.init_game(player1_deck=player1_deck, player2_deck=player2_deck)
-        controllers = {"P1": p1_controller, "P2": p2_controller}
-
-        while snapshot["result"] == "Ongoing" and snapshot["turn"] <= max_turns:
-            actions = snapshot.get("actions", [])
-            if not actions:
-                break
-            active_player = snapshot["active_player"]
-            controller = controllers[active_player]
-
-            if controller is None:
-                print_cs_snapshot(snapshot)
-                try:
-                    chosen = _prompt_cs_manual_action(snapshot)
-                except KeyboardInterrupt:
-                    break
-                actor_name = "manual"
-            else:
-                _, chosen = choose_cs_action_with_agent(controller, snapshot)
-                actor_name = getattr(controller, "name", controller.__class__.__name__)
-
-            if print_steps:
-                print(f"[turn {snapshot['turn']}] {active_player}:{actor_name} -> {chosen['text']}")
-            snapshot = session.apply_action(chosen["uid"])
-
-        if print_steps:
-            print_cs_snapshot(snapshot)
-        return snapshot
-    finally:
-        session.close()
-
-
-def run_cs_manual_vs_agent(
-    agent,
-    *,
-    human_player: str = "P1",
-    seed: Optional[int] = None,
-    max_turns: int = 100,
-    card_data_path: Optional[str] = None,
-    player1_deck: str = "",
-    player2_deck: str = "",
-    print_steps: bool = True,
-) -> Dict[str, Any]:
-    human_player = human_player.upper()
-    if human_player not in {"P1", "P2"}:
-        raise ValueError("human_player must be 'P1' or 'P2'")
-    p1_controller = None if human_player == "P1" else agent
-    p2_controller = None if human_player == "P2" else agent
-    return run_cs_mixed_match(
-        p1_controller=p1_controller,
-        p2_controller=p2_controller,
-        seed=seed,
-        max_turns=max_turns,
-        card_data_path=card_data_path,
-        player1_deck=player1_deck,
-        player2_deck=player2_deck,
-        print_steps=print_steps,
-    )
-
-
-def run_manual_match(
-    p1_world: int = 2,
-    p2_world: int = 6,
-    *,
-    seed: Optional[int] = None,
-    card_data_path: str = "Cards.csv",
-    first_player: Optional[PlayerID] = None,
-    enable_logging: bool = True,
-    log_base_path: Optional[str] = None,
-    include_action_options_in_log: bool = False,
-) -> GameState:
-    _require_legacy_engine()
-    from RL_AI.simulation.debug_view import describe_action_local, print_state
-    from RL_AI.simulation.logging import MatchLogger
-    card_db = load_supported_card_db(card_data_path=card_data_path)
-    initial_state = create_initial_game_state(
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=seed,
-        first_player=first_player,
-    )
-
-    runner = MatchRunner(initial_state, card_db, seed=seed)
-    runner.initialize()
-
-    logger: Optional[MatchLogger] = None
-    if enable_logging:
-        logger = MatchLogger(
-            log_base_path or _default_log_base("manual_match"),
-            card_db=card_db,
-            save_text_log=True,
-            include_action_options=include_action_options_in_log,
-        )
-        logger.log_match_start(
-            runner.state,
-            metadata=_build_match_metadata(
-                p1_world=p1_world,
-                p2_world=p2_world,
-                seed=seed,
-                first_player=first_player,
-                mode="manual",
-            ),
-        )
-
-    while not runner.is_done():
-        legal_actions = runner.get_legal_actions()
-        print_state(runner.state, legal_actions, runner.card_db)
-
-        if logger is not None:
-            logger.log_action_options(runner.state, legal_actions)
-
-        if not legal_actions:
-            print("No legal actions available. Stopping match.")
-            if logger is not None:
-                logger.log_event(
-                    "no_legal_actions",
-                    turn=runner.state.turn,
-                    active_player=("P1" if runner.state.active_player == PlayerID.P1 else "P2"),
-                    phase=(runner.state.phase.value if hasattr(runner.state.phase, "value") else str(runner.state.phase)),
-                )
-                logger.log_state_checkpoint(runner.state, note="no_legal_actions")
-            break
-
-        try:
-            action_index, action = choose_action_by_index(runner.state, legal_actions)
-        except KeyboardInterrupt:
-            print("\nMatch interrupted by user.")
-            if logger is not None:
-                logger.log_event(
-                    "manual_interrupt",
-                    turn=runner.state.turn,
-                    active_player=("P1" if runner.state.active_player == PlayerID.P1 else "P2"),
-                )
-                logger.log_match_end(runner.state, metadata={"interrupted": True})
-            raise
-
-        print("Chosen:", describe_action_local(runner.state, action))
-
-        if logger is not None:
-            logger.log_action_chosen(runner.state, action, action_index=action_index)
-
-        runner.step(action)
-
-        if logger is not None:
-            logger.log_state_checkpoint(runner.state)
-
-        print("\n" + "=" * 100 + "\n")
-
-    print_state(runner.state, card_db=runner.card_db)
-
-    if logger is not None:
-        logger.log_match_end(runner.state)
-        print(f"Logs written to: {logger.jsonl_path} and {logger.text_path}")
-
-    print("Match finished.")
-    return runner.state
-
-
-def run_random_match(
-    p1_world: int = 2,
-    p2_world: int = 6,
-    *,
-    seed: Optional[int] = None,
-    card_data_path: str = "Cards.csv",
-    first_player: Optional[PlayerID] = None,
-    max_steps: int = 500,
-    max_turns: Optional[int] = None,
-    enable_logging: bool = True,
-    log_base_path: Optional[str] = None,
-    print_steps: bool = True,
-    include_action_options_in_log: bool = False,
-) -> GameState:
-    _require_legacy_engine()
-    from RL_AI.simulation.debug_view import describe_action_local, print_state
-    from RL_AI.simulation.logging import MatchLogger
-    card_db = load_supported_card_db(card_data_path=card_data_path)
-    initial_state = create_initial_game_state(
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=seed,
-        first_player=first_player,
-    )
-
-    runner = MatchRunner(initial_state, card_db, seed=seed)
-    runner.initialize()
-
-    logger: Optional[MatchLogger] = None
-    if enable_logging:
-        logger = MatchLogger(
-            log_base_path or _default_log_base("random_match"),
-            card_db=card_db,
-            save_text_log=True,
-            include_action_options=include_action_options_in_log,
-        )
-        logger.log_match_start(
-            runner.state,
-            metadata=_build_match_metadata(
-                p1_world=p1_world,
-                p2_world=p2_world,
-                seed=seed,
-                first_player=first_player,
-                mode="random",
-                max_steps=max_steps,
-                max_turns=max_turns,
-            ),
-        )
-
-    steps = 0
-    while not runner.is_done() and steps < max_steps and not _turn_limit_reached(runner.state, max_turns):
-        legal_actions = runner.get_legal_actions()
-
-        if logger is not None:
-            logger.log_action_options(runner.state, legal_actions)
-
-        if not legal_actions:
-            print("No legal actions available. Stopping match.")
-            if logger is not None:
-                logger.log_event(
-                    "no_legal_actions",
-                    turn=runner.state.turn,
-                    active_player=("P1" if runner.state.active_player == PlayerID.P1 else "P2"),
-                    phase=(runner.state.phase.value if hasattr(runner.state.phase, "value") else str(runner.state.phase)),
-                )
-                logger.log_state_checkpoint(runner.state, note="no_legal_actions")
-            break
-
-        action_index, action = choose_action_randomly(legal_actions, runner.rng)
-
-        if print_steps:
-            print(f"[step {steps}] {describe_action_local(runner.state, action)}")
-
-        if logger is not None:
-            logger.log_action_chosen(runner.state, action, action_index=action_index)
-
-        runner.step(action)
-
-        if logger is not None:
-            logger.log_state_checkpoint(runner.state, note=f"random_step={steps}")
-
-        steps += 1
-
-    if steps >= max_steps and not runner.is_done():
-        if logger is not None:
-            logger.log_event("max_steps_reached", max_steps=max_steps)
-            logger.log_state_checkpoint(runner.state, note="max_steps_reached")
-    if _turn_limit_reached(runner.state, max_turns) and not runner.is_done():
-        if logger is not None:
-            logger.log_event("max_turns_reached", max_turns=max_turns, turn=runner.state.turn)
-            logger.log_state_checkpoint(runner.state, note="max_turns_reached")
-
-    print_state(runner.state, card_db=runner.card_db)
-
-    if logger is not None:
-        logger.log_match_end(runner.state, metadata={"steps": steps})
-        print(f"Logs written to: {logger.jsonl_path} and {logger.text_path}")
-
-    print(f"Random match finished after {steps} steps.")
-    return runner.state
-
-
-def run_agent_match(
-    p1_agent: BaseAgent,
-    p2_agent: BaseAgent,
-    *,
-    p1_world: int = 2,
-    p2_world: int = 6,
-    seed: Optional[int] = None,
-    card_data_path: str = "Cards.csv",
-    first_player: Optional[PlayerID] = None,
-    max_steps: int = 500,
-    max_turns: Optional[int] = None,
-    enable_logging: bool = True,
-    log_base_path: Optional[str] = None,
-    print_steps: bool = True,
-    include_action_options_in_log: bool = False,
-) -> GameState:
-    _require_legacy_engine()
-    from RL_AI.simulation.debug_view import describe_action_local, print_state
-    from RL_AI.simulation.logging import MatchLogger
-    card_db = load_supported_card_db(card_data_path=card_data_path)
-    initial_state = create_initial_game_state(
-        p1_world=p1_world,
-        p2_world=p2_world,
-        card_data_path=card_data_path,
-        seed=seed,
-        first_player=first_player,
-    )
-
-    runner = MatchRunner(initial_state, card_db, seed=seed)
-    runner.initialize()
-
-    logger: Optional[MatchLogger] = None
-    if enable_logging:
-        logger = MatchLogger(
-            log_base_path or _default_log_base("agent_match"),
-            card_db=card_db,
-            save_text_log=True,
-            include_action_options=include_action_options_in_log,
-        )
-        logger.log_match_start(
-            runner.state,
-            metadata={
-                **_build_match_metadata(
-                    p1_world=p1_world,
-                    p2_world=p2_world,
-                    seed=seed,
-                    first_player=first_player,
-                    mode="agent_vs_agent",
-                    max_steps=max_steps,
-                    max_turns=max_turns,
-                ),
-                "p1_agent": p1_agent.name,
-                "p2_agent": p2_agent.name,
-            },
-        )
-
-    agent_by_player = {
-        PlayerID.P1: p1_agent,
-        PlayerID.P2: p2_agent,
+def condense_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "turn": snap.get("turn", 0),
+        "active_player": snap.get("active_player", ""),
+        "phase": snap.get("phase", ""),
+        "result": snap.get("result", ""),
+        "board": [
+            {
+               "uid": c["uid"], 
+               "owner": c["owner"], 
+               "name": str(c.get("name", c.get("card_id"))), 
+               "role": c.get("role", "none"),
+               "hp": c.get("hp", 0), 
+               "max_hp": c.get("max_hp", 0),
+               "pos_x": c.get("pos_x", -1), 
+               "pos_y": c.get("pos_y", -1)
+            } for c in snap.get("board", []) if c.get("is_placed")
+        ],
+        "p1_hp": next((c.get("hp", 0) for c in snap.get("board", []) if c.get("owner")=="P1" and c.get("role")=="Leader" and c.get("is_placed")), 0),
+        "p2_hp": next((c.get("hp", 0) for c in snap.get("board", []) if c.get("owner")=="P2" and c.get("role")=="Leader" and c.get("is_placed")), 0)
     }
 
-    steps = 0
-    while not runner.is_done() and steps < max_steps and not _turn_limit_reached(runner.state, max_turns):
-        legal_actions = runner.get_legal_actions()
+def main():
+    parser = argparse.ArgumentParser(description="Run SeaEngine matches and record raw logs.")
+    parser.add_argument("--p1", type=str, default="rl_untrained", choices=["human", "random", "greedy", "rl_untrained", "rl_trained"])
+    parser.add_argument("--p2", type=str, default="greedy", choices=["human", "random", "greedy", "rl_untrained", "rl_trained"])
+    parser.add_argument("--p1_model", type=str, default="", help="Path to P1 model if p1 is rl_trained")
+    parser.add_argument("--p2_model", type=str, default="", help="Path to P2 model if p2 is rl_trained")
+    parser.add_argument("--matches", type=int, default=1, help="Number of matches to run per configuration")
+    parser.add_argument("--max_turns", type=int, default=100, help="Max turns per game")
+    parser.add_argument("--deck1", type=str, default="", help="P1 deck string")
+    parser.add_argument("--deck2", type=str, default="", help="P2 deck string")
+    parser.add_argument("--comprehensive", action="store_true", help="Run full cross-validation grid (800 matches recommended)")
+    args = parser.parse_args()
 
-        if logger is not None:
-            logger.log_action_options(runner.state, legal_actions)
+    OR_DECK = '["Or_L", "Or_B", "Or_N", "Or_R", "Or_P", "Or_P", "Or_P"]'
+    CL_DECK = '["Cl_L", "Cl_B", "Cl_N", "Cl_R", "Cl_P", "Cl_P", "Cl_P"]'
 
-        if not legal_actions:
-            print("No legal actions available. Stopping match.")
-            if logger is not None:
-                logger.log_event(
-                    "no_legal_actions",
-                    turn=runner.state.turn,
-                    active_player=("P1" if runner.state.active_player == PlayerID.P1 else "P2"),
-                    phase=(runner.state.phase.value if hasattr(runner.state.phase, "value") else str(runner.state.phase)),
-                )
-                logger.log_state_checkpoint(runner.state, note="no_legal_actions")
-            break
+    configs = []
+    if args.comprehensive:
+        print("=== Comprehensive Grid Evaluation ===")
+        args.matches = 100 if args.matches == 1 else args.matches # Default to 100 per grid if not specified
+        target_agent = "rl_trained" if args.p1_model else "rl_untrained"
+        
+        for opp in ["random", "greedy"]:
+            for rl_pos in ["P1", "P2"]:
+                for rl_deck_name in ["Orange", "Clear"]:
+                    p1_type = target_agent if rl_pos == "P1" else opp
+                    p2_type = opp if rl_pos == "P1" else target_agent
+                    
+                    deck1_name = rl_deck_name if rl_pos == "P1" else ("Clear" if rl_deck_name == "Orange" else "Orange")
+                    deck2_name = rl_deck_name if rl_pos == "P2" else ("Clear" if rl_deck_name == "Orange" else "Orange")
+                    
+                    d1_str = OR_DECK if deck1_name == "Orange" else CL_DECK
+                    d2_str = OR_DECK if deck2_name == "Orange" else CL_DECK
+                    
+                    configs.append({
+                        "p1_type": p1_type, "p2_type": p2_type,
+                        "d1_str": d1_str, "d2_str": d2_str,
+                        "desc": f"RL({rl_pos}, {rl_deck_name}) vs {opp.capitalize()}"
+                    })
+    else:
+        configs.append({
+            "p1_type": args.p1, "p2_type": args.p2,
+            "d1_str": args.deck1, "d2_str": args.deck2,
+            "desc": f"P1 ({args.p1}) vs P2 ({args.p2})"
+        })
 
-        acting_agent = agent_by_player[runner.current_player()]
-        action_index, action = choose_action_with_agent(
-            acting_agent,
-            runner.state,
-            legal_actions,
-            card_db=runner.card_db,
-        )
+    log_dir = Path(__file__).resolve().parent / "log"
+    log_dir.mkdir(exist_ok=True, parents=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"raw_match_{ts}.jsonl"
 
-        if print_steps:
-            print(f"[step {steps}] {acting_agent.name}: {describe_action_local(runner.state, action)}")
+    total_matches = len(configs) * args.matches
+    print(f"Total Configurations: {len(configs)}")
+    print(f"Matches per config: {args.matches}")
+    print(f"Total Matches to run: {total_matches}")
+    print(f"Saving raw logs to {log_path}")
 
-        if logger is not None:
-            logger.log_action_chosen(runner.state, action, action_index=action_index)
+    session = SeaEngineSession()
+    session.start()
+    
+    agent_cache = {}
+    def get_cached_agent(atype, is_p1):
+        key = f"{atype}_{is_p1}"
+        if key not in agent_cache:
+            model_path = args.p1_model if is_p1 else args.p2_model
+            if args.comprehensive and "model" not in key and "trained" in atype:
+                model_path = args.p1_model or args.p2_model
+            ag = get_agent_by_type(atype, model_path)
+            ag.name = atype
+            agent_cache[key] = ag
+        return agent_cache[key]
 
-        runner.step(action)
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            match_counter = 0
+            for cfg in configs:
+                print(f"\n[Config] {cfg['desc']}")
+                
+                p1_ag = get_cached_agent(cfg["p1_type"], True)
+                p2_ag = get_cached_agent(cfg["p2_type"], False)
+                p1_ctx = p1_ag.sampling_mode(False) if hasattr(p1_ag, "sampling_mode") else nullcontext()
+                p2_ctx = p2_ag.sampling_mode(False) if hasattr(p2_ag, "sampling_mode") else nullcontext()
 
-        if logger is not None:
-            logger.log_state_checkpoint(runner.state, note=f"agent_step={steps}")
+                with p1_ctx, p2_ctx:
+                    for _ in range(args.matches):
+                        match_counter += 1
+                        snapshot = session.init_game(player1_deck=cfg["d1_str"], player2_deck=cfg["d2_str"])
+                        agents = {"P1": p1_ag, "P2": p2_ag}
+                        
+                        match_record = {
+                            "match": match_counter,
+                            "p1": cfg["p1_type"],
+                            "p2": cfg["p2_type"],
+                            "config": cfg["desc"],
+                            "events": []
+                        }
+                        
+                        while snapshot["result"] == "Ongoing" and snapshot["turn"] <= args.max_turns:
+                            actions = snapshot.get("actions", [])
+                            if not actions: break
 
-        steps += 1
+                            acting_agent = agents[snapshot["active_player"]]
+                            _, action = choose_action_with_agent(acting_agent, snapshot)
 
-    if steps >= max_steps and not runner.is_done():
-        if logger is not None:
-            logger.log_event("max_steps_reached", max_steps=max_steps)
-            logger.log_state_checkpoint(runner.state, note="max_steps_reached")
-    if _turn_limit_reached(runner.state, max_turns) and not runner.is_done():
-        if logger is not None:
-            logger.log_event("max_turns_reached", max_turns=max_turns, turn=runner.state.turn)
-            logger.log_state_checkpoint(runner.state, note="max_turns_reached")
+                            evt = {"before": condense_snapshot(snapshot), "action": action}
+                            snapshot = session.apply_action(action["uid"])
+                            evt["after"] = condense_snapshot(snapshot)
+                            match_record["events"].append(evt)
 
-    if print_steps:
-        print_state(runner.state, card_db=runner.card_db)
+                        match_record["final_result"] = snapshot["result"]
+                        match_record["final_turn"] = snapshot["turn"]
+                        f.write(json.dumps(match_record, ensure_ascii=False) + "\n")
+                        
+                        if match_counter % 20 == 0 or match_counter == total_matches:
+                            print(f"  [{cfg['desc']}] {match_counter}/{total_matches} matches completed...")
 
-    if logger is not None:
-        logger.log_match_end(
-            runner.state,
-            metadata={
-                "steps": steps,
-                "p1_agent": p1_agent.name,
-                "p2_agent": p2_agent.name,
-            },
-        )
-        print(f"Logs written to: {logger.jsonl_path} and {logger.text_path}")
-
-    print(f"Agent match finished after {steps} steps.")
-    return runner.state
-
+    finally:
+        session.close()
+    
+    print("\nAll matches finished!")
+    print(f"To generate human-readable file: python RL_AI/simulation/balance_logger.py {log_path}")
 
 if __name__ == "__main__":
-    # Manual play:
-    #   python -m RL_AI.simulation.match_runner
-    #
-    # Random rollout from Python:
-    #   from RL_AI.simulation.match_runner import run_random_match
-    #   run_random_match(seed=7)
-    run_manual_match(p1_world=2, p2_world=6, seed=7)
-
-
-
+    main()

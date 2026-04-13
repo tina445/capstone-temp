@@ -1,0 +1,7 @@
+=== Evaluation Report ===
+Episodes: 100
+P1 (rl) wins: 43 (43.0%)
+P2 (random) wins: 52 (52.0%)
+Draws: 5 (5.0%)
+Average steps: 23.21
+Average final turn: 0.00

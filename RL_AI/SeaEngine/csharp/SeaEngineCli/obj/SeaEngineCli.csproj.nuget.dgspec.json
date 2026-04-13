@@ -10,7 +10,7 @@
         "projectUniqueName": "C:\\code\\capstone-temp\\RL_AI\\SeaEngine\\csharp\\SeaEngineCli\\SeaEngineCli.csproj",
         "projectName": "SeaEngineCli",
         "projectPath": "C:\\code\\capstone-temp\\RL_AI\\SeaEngine\\csharp\\SeaEngineCli\\SeaEngineCli.csproj",
-        "packagesPath": "C:\\code\\capstone-temp\\.dotnet_home\\.nuget\\packages\\",
+        "packagesPath": "C:\\Users\\user\\.nuget\\packages\\",
         "outputPath": "C:\\code\\capstone-temp\\RL_AI\\SeaEngine\\csharp\\SeaEngineCli\\obj\\",
         "projectStyle": "PackageReference",
         "fallbackFolders": [
@@ -351,7 +351,7 @@
         "projectUniqueName": "C:\\code\\capstone-temp\\RL_AI\\SeaEngine\\csharp\\SeaEngine\\SeaEngine.csproj",
         "projectName": "SeaEngine",
         "projectPath": "C:\\code\\capstone-temp\\RL_AI\\SeaEngine\\csharp\\SeaEngine\\SeaEngine.csproj",
-        "packagesPath": "C:\\code\\capstone-temp\\.dotnet_home\\.nuget\\packages\\",
+        "packagesPath": "C:\\Users\\user\\.nuget\\packages\\",
         "outputPath": "C:\\code\\capstone-temp\\RL_AI\\SeaEngine\\csharp\\SeaEngine\\obj\\",
         "projectStyle": "PackageReference",
         "fallbackFolders": [

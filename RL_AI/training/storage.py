@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-# PPO 학습에 필요한 rollout 저장 구조를 정의하는 파일
-# 한 수마다 state/action/log_prob/value를 쌓고, 에피소드 종료 후 return/advantage를 계산한다.
-
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -65,3 +62,4 @@ class RolloutBuffer:
         variance = sum((value - mean) ** 2 for value in advantages) / len(advantages)
         std = (variance + 1e-8) ** 0.5
         return [(value - mean) / std for value in advantages]
+
