@@ -18,7 +18,7 @@ public class QueryPopUp : MonoBehaviour
 
     private int _current_query = 0;
 
-    private List<(string uid, string effectId)> _actionList = new();
+    private List<(string uid, string id, string content)> _actionList = new();
 
     public void Init()
     {
@@ -44,13 +44,13 @@ public class QueryPopUp : MonoBehaviour
     {
         if (int.TryParse(ActionIndexInput.text, out int idx))
         {
-            string uid = (idx == -1)? GetUidByIndex(_actionList, _actionList.Count - 1) : GetUidByIndex(_actionList, idx); 
+            string uid = (idx == -1) ? GetUidByIndex(_actionList, _actionList.Count - 1) : GetUidByIndex(_actionList, idx);
             NetworkManagerUnity.Instance.Session.Answer(_current_query, Encoding.UTF8.GetBytes(uid));
             popUpScreen.enabled = false;
         }
     }
 
-    public List<(string uid, string content)> ParseActions(string json)
+    public List<(string uid, string id, string content)> ParseActions(string json)
     {
         var root = JObject.Parse(json);
 
@@ -59,12 +59,13 @@ public class QueryPopUp : MonoBehaviour
             .Select(action =>
             {
                 string uid = action["Uid"]?.ToString() ?? string.Empty;
+                string id = action["Id"]?.ToString() ?? string.Empty;
 
                 var parts = new List<string>();
 
                 foreach (var prop in action.Properties())
                 {
-                    if (prop.Name == "Uid")
+                    if (prop.Name == "Uid" || prop.Name == "Id")
                         continue;
 
                     if (prop.Value is JObject obj)
@@ -82,21 +83,21 @@ public class QueryPopUp : MonoBehaviour
 
                 string content = string.Join(" | ", parts);
 
-                return (uid, content);
+                return (uid, id, content);
             })
             .ToList()
-            ?? new List<(string uid, string content)>();
+            ?? new List<(string uid, string id, string content)>();
     }
 
-    public string ActionsToString(List<(string uid, string effectId)> actions)
+    public string ActionsToString(List<(string uid, string id, string content)> actions)
     {
         if (actions == null || actions.Count == 0)
             return string.Empty;
 
-        return string.Join("\n", actions.Select(x => $"({x.uid}, {x.effectId})"));
+        return string.Join("\n", actions.Select((x, idx) => $"{idx}: ({x.uid}, {x.id}, {x.content})"));
     }
 
-    public string GetUidByIndex(List<(string uid, string effectId)> actions, int idx)
+    public string GetUidByIndex(List<(string uid, string id, string content)> actions, int idx)
     {
         if (actions == null || idx < 0 || idx >= actions.Count)
             return string.Empty;
