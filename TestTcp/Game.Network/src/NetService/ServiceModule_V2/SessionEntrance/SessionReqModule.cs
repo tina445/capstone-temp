@@ -1,17 +1,19 @@
 
 using System.ComponentModel;
+using System.ComponentModel.Design;
+using System.Net.WebSockets;
 
 namespace Game.Network.Service
 {
     public class SessionReqModule : IServiceModule
                                     , IRequest<SessionReq, SessionRsp>
-    {        
+    {
         private INetAPI _net;
         private ISelfWriter _self;
         private IGameWriter _game;
         private IHostReader _host;
 
-        private bool _onRequest;
+  
 
         public void Init(ServiceContext_V2 context)
         {
@@ -37,26 +39,26 @@ namespace Game.Network.Service
         {
             var payload = new byte[SessionReq.Codec.GetSize(msg)];
             PacketWriter writer = new(payload);
-            SessionReq.Codec.Write(ref writer, msg); 
+            SessionReq.Codec.Write(ref writer, msg);
 
             switch (msg.type)
             {
                 case SessionReqType.ReqEnter:
-                    _  = _net.AsyncRequestQuery(NetEventHandlerId.Constant.Session, _host.connId, payload, 10000, 
+                    _ = _net.AsyncRequestQuery(NetEventHandlerId.Constant.Session, _host.connId, payload, 10000,
                         (connId, result) => ReqEnterCallBack(connId, result, succ, fail));
                     return;
                 case SessionReqType.ReqExit:
-                    _  = _net.AsyncRequestQuery(NetEventHandlerId.Constant.Session, _host.connId, payload, 10000, 
+                    _ = _net.AsyncRequestQuery(NetEventHandlerId.Constant.Session, _host.connId, payload, 10000,
                         (connId, result) => ReqExitCallBack(connId, result, succ, fail));
                     return;
                 default:
                     return;
-            }   
+            }
         }
 
         private void ReqEnterCallBack(ConnId connId, QueryTaskResult result, Action<SessionRsp> succ, Action<string> fail)
-        {            
-            if (connId != _host.connId) fail.Invoke("Rsp is differnt with host"); 
+        {
+            if (connId != _host.connId) fail.Invoke("Rsp is differnt with host");
             else if (result.IsTimeOut) fail.Invoke("Time Out");
             else if (result.IsResponded)
             {
@@ -81,7 +83,7 @@ namespace Game.Network.Service
 
         private void ReqExitCallBack(ConnId connId, QueryTaskResult result, Action<SessionRsp> succ, Action<string> fail)
         {
-            if (connId != _host.connId) fail.Invoke("Rsp is differnt with host"); 
+            if (connId != _host.connId) fail.Invoke("Rsp is differnt with host");
             else if (result.IsTimeOut) fail.Invoke("Time Out");
             else if (result.IsResponded)
             {
@@ -100,7 +102,7 @@ namespace Game.Network.Service
                 {
                     fail.Invoke($"Fail during Reading Rsp. Exception : {e.Message}");
                 }
-            }            
+            }
 
         }
 
